@@ -1,0 +1,98 @@
+.body {
+  font-family: sans-serif;
+}
+.inbound, .outbound {
+  font-size: 15;
+  text-align: center;
+}
+.train {
+  padding: 10px;
+  height: 40;
+}
+.inbound1, .outbound1 {
+  height: 60;
+}
+
+.inbound1, .outbound1, .stationTitle, .inboundTitle, .outboundTitle {
+  font-size: 50;
+}
+.stationTitle {
+  width: 100%;
+  text-align: center;
+  padding-bottom: 20px;
+}
+
+.direction {
+  display: inline;
+  font-size: 30;
+  width:40%;
+  padding-left: 20px;
+  padding-right: 20px;
+}
+.inbound {
+  float:left;
+}
+.outbound {
+  float:right;
+}
+.train {
+  display: block;
+  width: 100%;
+}
+
+.trainName {
+  float: left;
+}
+
+.countdown {
+  float: right;
+}
+
+.realtime {
+  font-size: 20;
+  float: center;
+}
+
+.inbound1 .realtime, .outbound1 .realtime {
+  font-size: 30;
+}
+
+.inbound1, .outbound1 {
+  padding-bottom: 15px;
+}
+.trainName {
+  display: inline;
+  height:40px;
+  color: #fff;
+  border: 3px #777;
+  background-color: #777;
+  border-radius:50%;
+  -moz-border-radius:50%;
+  -webkit-border-radius:50%;
+  width:40px;
+}
+.inbound1 .trainName, .outbound1 .trainName {
+  height:60px;
+  width:60px;
+
+}
+.hidden {
+  display: none;
+}
+.countdown {
+  display: inline;
+}
+.realtime {
+  display: inline;
+  font-style: italic;
+}
+.alerts, .alerts2 {
+  width: 100%;
+  text-align: center;
+  padding-top: 20px;
+  float:left;
+}
+.alertsTitle {
+  font-size: 30;
+  padding: 10px;
+}
