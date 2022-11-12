@@ -68,7 +68,6 @@ fn to_countdown(time: i64, now_sec: i64, estimated: bool, name: &str) -> TrainTi
     }
 
     let mut hour = (time / 3600) % 12;
-    // *1: Sometimes they let it overflow to 25h
     if hour == 0 {
         hour = 12
     }
@@ -181,13 +180,7 @@ async fn get_countdown(client: Data<Client>, station: String) -> Option<Countdow
 
     let mut alerts : Vec<String> = Vec::new();
     let mut route_times : HashMap<String, Vec<TrainTime>> = HashMap::new();
-    // if !payload.is_ok() {
-    //     return Ok(HttpResponse::Ok().body(res.body().await.unwrap()));
-    // }
     let json = payload.unwrap();
-    // if !json.contains_key("item") {
-    //     return Ok(HttpResponse::Ok().body(res.body().await.unwrap()));
-    // }
     let item = json.get(0).and_then(Value::as_object).unwrap();
     for alert in item.get("alerts").and_then(Value::as_array).unwrap_or(&EMPTY_VEC).iter() {
         let alert_start = alert.get("effectiveStartDate")
@@ -237,6 +230,7 @@ async fn get_countdown(client: Data<Client>, station: String) -> Option<Countdow
 
     Some(Countdown {
         name : stop_name.to_string(),
+        // TODO actually use alerts
         alerts : alerts,
         status: train_status.await.unwrap(),
         route_times : route_times
