@@ -13,7 +13,8 @@ a station countdown timer and any alerts in a kindle-friendly interface.
 
 ### Building
 
-* Run `cargo build --release`
+1. [Install Rust](https://doc.rust-lang.org/cargo/getting-started/installation.html)
+2. Run `cargo build --release`
 
 ## Usage
 1. Run `./target/release/mta`
