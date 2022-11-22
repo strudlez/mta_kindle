@@ -28,3 +28,6 @@ To modify, visit e.g. http://localhost:8080#A32&F.
 This monitors W 4th St, and the A and F.
 
 The full station list is available from the MTA [here](https://atisdata.s3.amazonaws.com/Station/Stations.csv).
+
+### Turning off Sleep on your Kindle
+Visit [~ds](https://www.reddit.com/r/kindle/comments/rzsjbw/pro_tip_you_can_disable_auto_sleep_mode_be_warned/) in the browser to disable sleep. This also disables manual sleep until you restart the device.
