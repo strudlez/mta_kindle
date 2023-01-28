@@ -46,6 +46,7 @@ struct Countdown {
 
 #[derive(Serialize, Debug, Clone)]
 struct TrainTime {
+    seconds: i64,
     mins: i64,
     time: String,
     estimated: bool,
@@ -59,13 +60,13 @@ struct TrainStatus {
 }
 
 fn to_countdown(time: i64, now_sec: i64, estimated: bool, name: &str) -> TrainTime {
-    let diff = time - now_sec;
+    let mut diff = time - now_sec;
     // Is rounded or floor preferable
-    let mut diffmin = diff/60;
     // When the day changes we go from 23h to 0h
-    if diffmin < -240 {
-        diffmin = diffmin + 1440
+    if diff < -14400 {
+        diff = diff + 86400
     }
+    let diffmin = diff/60;
 
     let mut hour = (time / 3600) % 12;
     if hour == 0 {
@@ -73,6 +74,7 @@ fn to_countdown(time: i64, now_sec: i64, estimated: bool, name: &str) -> TrainTi
     }
     let min = (time / 60) % 60;
     return TrainTime {
+        seconds: diff,
         mins: diffmin,
         time: format!("{}:{:02}", hour, min),
         estimated: estimated,
@@ -222,7 +224,7 @@ async fn get_countdown(client: Data<Client>, station: String) -> Option<Countdow
         }
     }
     for routes in route_times.values_mut() {
-        routes.sort_by_key(|r| r.mins);
+        routes.sort_by_key(|r| r.seconds);
     }
     let stop_name = item.get("stop").and_then(Value::as_object)
         .and_then(|stop| { stop.get("name") }).and_then(Value::as_str)
