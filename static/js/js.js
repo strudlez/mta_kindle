@@ -66,7 +66,7 @@ function loadTimes() {
       }
       i++;
       name = "outbound"
-      rName = route.replace(/ [-&] .*/, "");
+      rName = route.replace(/ [-&] .*/, "").replace(/, .*/, "");
       if (route == "Manhattan" ||
         route.search("Uptown") > -1 ||
         outbound == true) {
