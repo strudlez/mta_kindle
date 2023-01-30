@@ -60,15 +60,34 @@ function loadTimes() {
       route_times = {'outbound': [], 'inbound': []};
     }
     i = 0;
+    var secondRoute = ""
     for (var route in route_times) {
       if (i > 1) {
         break;
       }
+      if (i == 1) {
+        secondRoute = route
+      }
       i++;
+    }
+    i = 0;
+    for (var route in route_times) {
+      if (i > 1) {
+        break;
+      }
       name = "outbound"
       rName = route.replace(/ [-&] .*/, "").replace(/, .*/, "");
+      otherRoute = ""
+      if (i == 0) {
+        otherRoute = secondRoute
+      }
+      i++;
       if (route == "Manhattan" ||
+        route == '34 St - Hudson Yards' ||
+        route == '8 Av' ||
         route.search("Uptown") > -1 ||
+        otherRoute == 'Church Av' ||
+        otherRoute.search('Downtown') > -1 ||
         outbound == true) {
         name = "inbound";
       } else {
