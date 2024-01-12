@@ -3,8 +3,13 @@ var EXTRA_TRAIN = '4';
 setFromHash();
 
 function setFromHash() {
+  urlParams = new URLSearchParams(window.location.search);
+  hash = urlParams.get('q');
+
   if (window.location.hash) {
     hash = window.location.hash.replace('#','');
+  }
+  if (hash) {
     if (hash.search('&') > -1) {
       s = hash.split('&');
       STATION = s[0]
