@@ -3,8 +3,11 @@ var EXTRA_TRAIN = '4';
 setFromHash();
 
 function setFromHash() {
-  urlParams = new URLSearchParams(window.location.search);
-  hash = urlParams.get('q');
+  hash = '';
+  if (window.location.search) {
+    hash = window.location.search.replace('q=','');
+
+  }
 
   if (window.location.hash) {
     hash = window.location.hash.replace('#','');
