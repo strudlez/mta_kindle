@@ -22,6 +22,10 @@
   padding-bottom: 20px;
 }
 
+.directions {
+  height: 300px;
+}
+
 .direction {
   display: inline;
   font-size: 30;

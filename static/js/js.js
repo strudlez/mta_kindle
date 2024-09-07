@@ -1,34 +1,32 @@
-var STATION = 'L08';
+var STATIONS = ['L08'];
 var EXTRA_TRAIN = '4';
 setFromHash();
 
 function setFromHash() {
-  hash = '';
+  hash = ''
   if (window.location.search) {
-    hash = window.location.search.replace('q=','');
-
+    hash = window.location.search.replace('?q=','')
   }
-
   if (window.location.hash) {
     hash = window.location.hash.replace('#','');
   }
   if (hash) {
     if (hash.search('&') > -1) {
       s = hash.split('&');
-      STATION = s[0]
+      STATIONS = s[0].split(',')
       EXTRA_TRAIN = s[1]
     } else {
-      STATION = hash
+      STATIONS = hash.split(',')
     }
   }
 }
 
 function hashChange() {
   if (window.location.hash) {
-    st = STATION;
+    st = STATIONS[0];
     et = EXTRA_TRAIN;
     setFromHash();
-    if (st != STATION) {
+    if (st != STATIONS[0]) {
       loadTimes();
     }
     if (et != EXTRA_TRAIN) {
@@ -37,14 +35,33 @@ function hashChange() {
   }
 }
 
-function loadTimes() {
+function setupStations() {
+  if (STATIONS.length > 1) {
+    var stationBase = document.getElementById("station0");
+    var stationHtml = '';
+    for (var i = 0; i < STATIONS.length; i++) {
+      stationHtml += '<div id = "station' + i + '">' + stationBase.innerHTML + '</div>';
+    }
+    document.getElementById("stations").innerHTML = stationHtml;
+  }
+  window.setTimeout(loadTimesFromUrl, 1);
+}
+
+function loadTimesFromUrl() {
+  for (var i = 0; i < STATIONS.length; i++) {
+    var station = STATIONS[i];
+    var stationEl = document.getElementById("station" + i);
+    loadTimes(station, stationEl, (i == 0));
+  }
+}
+
+function loadTimes(station, stationEl, doAlert) {
   const xhttp = new XMLHttpRequest();
-  train = STATION[0]
+  var train = station[0]
   xhttp.onload = function() {
     js = JSON.parse(this.responseText);
-    var station = document.getElementById("station");
-    station.classList.remove("hidden");
-    station.querySelector(".stationTitle").innerHTML = js.name;
+    stationEl.classList.remove("hidden");
+    stationEl.querySelector(".stationTitle").innerHTML = js.name;
     alerts = "";
     for (i = 0; i < js.status.alerts.length; i++) {
       if (alerts != "") {
@@ -52,13 +69,16 @@ function loadTimes() {
       }
       alerts += js.status.alerts[i];
     }
-    var alertEl = station.querySelector(".alerts");
-    if (js.status.status == "Good Service") {
-      alertEl.classList.add("hidden");
-    } else {
-      alertEl.classList.remove("hidden");
-      alertEl.querySelector(".alertsTitle").innerHTML = train + ': ' + js.status.status
-      alertEl.querySelector(".alertsBody").innerText = alerts
+    if (doAlert) {
+      var body = document.getElementById("main")
+      var alertEl = body.querySelector(".alerts");
+      if (js.status.status == "Good Service") {
+        alertEl.classList.add("hidden");
+      } else {
+        alertEl.classList.remove("hidden");
+        alertEl.querySelector(".alertsTitle").innerHTML = train + ': ' + js.status.status
+        alertEl.querySelector(".alertsBody").innerText = alerts
+      }
     }
     outbound = false;
 
@@ -102,9 +122,9 @@ function loadTimes() {
         outbound = true;
       }
       times = route_times[route]
-      station.querySelector("." + name + "Title").innerHTML = rName;
+      stationEl.querySelector("." + name + "Title").innerHTML = rName;
       for (j = 0; j < 3; j++) {
-        el = station.querySelector("." + name + (j+1))
+        el = stationEl.querySelector("." + name + (j+1))
         elName = el.querySelector(".trainName");
         elCount = el.querySelector(".countdown");
         elTime = el.querySelector(".realtime");
@@ -114,20 +134,46 @@ function loadTimes() {
           el.classList.remove("hidden");
           time = times[j];
           elName.innerHTML = time.train_name;
+          if (STATIONS.length > 1) {
+            colorTrain(elName, time.train_name);
+          }
           elCount.innerHTML = time.mins;
           elTime.innerHTML = time.time;
         }
       }
     }
   }
-  xhttp.open("GET", "/mta/countdown/" + STATION, true);
+  xhttp.open("GET", "/mta/countdown/" + station, true);
   xhttp.send();
+}
+
+function colorTrain(el, train) {
+  color = '#777';
+  if (train == '1' || train == '2' || train == '3') {
+    color = '#EE352E';
+  } else if (train == '4' || train == '5' || train == '6') {
+    color = '#00933C';
+  } else if (train == '7') {
+    color = '#B933AD';
+  } else if (train == 'A' || train == 'C' || train == 'E') {
+    color = '#0039A6';
+  } else if (train == 'B' || train == 'D' || train == 'F' || train == 'M') {
+    color = '#FF6319';
+  } else if (train == 'N' || train == 'Q' || train == 'R' || train == 'W') {
+    color = '#FCCC0A';
+  } else if (train == 'J' || train == 'Z') {
+    color = '#996633';
+  } else if (train == 'L') {
+  } else if (train == 'G') {
+    color = '#6CBE45';
+  }
+  el.style.setProperty('background-color', color);
 }
 
 function loadAlert2() {
   if (EXTRA_TRAIN == '') {
-    var station = document.getElementById("station");
-    var alertEl = station.querySelector(".alerts2");
+    var body = document.getElementById("main");
+    var alertEl = body.querySelector(".alerts2");
     alertEl.classList.add("hidden");
     return;
   }
@@ -142,8 +188,8 @@ function loadAlert2() {
       }
       alerts += js.alerts[i];
     }
-    var station = document.getElementById("station");
-    var alertEl = station.querySelector(".alerts2");
+    var body = document.getElementById("main");
+    var alertEl = body.querySelector(".alerts2");
     if (js.status == "Good Service") {
       alertEl.classList.add("hidden");
     } else {
@@ -156,10 +202,10 @@ function loadAlert2() {
   xhttp.send();
 }
 
-loadTimes();
+window.setTimeout(setupStations, 1);
 window.setTimeout(loadAlert2, 10);
 
-window.setInterval(loadTimes, 60000);
+window.setInterval(loadTimesFromUrl, 60000);
 window.setInterval(loadAlert2, 60000);
 
 window.setTimeout(function() {
