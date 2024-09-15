@@ -136,7 +136,6 @@ function loadTimes(station, stationEl, doAlert) {
           time = times[j];
           var trainName = time.train_name;
 
-          console.log(trainName);
           if (trainName.length == 2 && trainName[1] == 'X') {
             trainName = trainName[0];
             elColor.classList.add('express');
