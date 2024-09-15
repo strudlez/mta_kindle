@@ -44,7 +44,7 @@
   width: 100%;
 }
 
-.trainName {
+.trainColor {
   float: left;
 }
 
@@ -64,18 +64,29 @@
 .inbound1, .outbound1 {
   padding-bottom: 15px;
 }
-.trainName {
+.trainColor {
   display: inline;
   height:40px;
   color: #fff;
   border: 3px #777;
   background-color: #777;
+  width:40px;
+}
+
+.trainColor.local {
   border-radius:50%;
   -moz-border-radius:50%;
   -webkit-border-radius:50%;
   width:40px;
 }
-.inbound1 .trainName, .outbound1 .trainName {
+.trainColor.express {
+  transform: rotate(-45deg);
+}
+.trainColor.express > .trainName {
+  transform: rotate(45deg);
+}
+
+.inbound1 .trainColor, .outbound1 .trainColor {
   height:60px;
   width:60px;
 

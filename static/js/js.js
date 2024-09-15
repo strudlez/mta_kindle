@@ -126,6 +126,7 @@ function loadTimes(station, stationEl, doAlert) {
       for (j = 0; j < 3; j++) {
         el = stationEl.querySelector("." + name + (j+1))
         elName = el.querySelector(".trainName");
+        elColor = el.querySelector(".trainColor");
         elCount = el.querySelector(".countdown");
         elTime = el.querySelector(".realtime");
         if (j >= times.length) {
@@ -133,9 +134,21 @@ function loadTimes(station, stationEl, doAlert) {
         } else {
           el.classList.remove("hidden");
           time = times[j];
-          elName.innerHTML = time.train_name;
+          var trainName = time.train_name;
+
+          console.log(trainName);
+          if (trainName.length == 2 && trainName[1] == 'X') {
+            trainName = trainName[0];
+            elColor.classList.add('express');
+            elColor.classList.remove('local');
+          } else {
+            elColor.classList.add('local');
+            elColor.classList.remove('express');
+          }
+
+          elName.innerHTML = trainName;
           if (STATIONS.length > 1) {
-            colorTrain(elName, time.train_name);
+            colorTrain(elColor, trainName);
           }
           elCount.innerHTML = time.mins;
           elTime.innerHTML = time.time;
