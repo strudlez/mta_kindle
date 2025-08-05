@@ -43,6 +43,9 @@ function setupStations() {
       stationHtml += '<div id = "station' + i + '">' + stationBase.innerHTML + '</div>';
     }
     document.getElementById("stations").innerHTML = stationHtml;
+    if (window.innerWidth < 1200) {
+      document.getElementById("stations").classList.add('small')
+    }
   }
   window.setTimeout(loadTimesFromUrl, 1);
 }

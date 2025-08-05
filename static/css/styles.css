@@ -13,9 +13,16 @@
   height: 60;
 }
 
-.inbound1, .outbound1, .stationTitle, .inboundTitle, .outboundTitle {
+.inbound1, .outbound1, .stationTitle, .inboundTitle, .outboundTitle, .outbound1.train, .inbound1.train {
   font-size: 50;
 }
+.outbound1 > .trainName, .inbound1 > .trainNam {
+  font-size: 50;
+}
+.small .stationTitle, .small .inboundTitle, .small .outboundTitle {
+  font-size: 30;
+}
+
 .stationTitle {
   width: 100%;
   text-align: center;
@@ -24,6 +31,10 @@
 
 .directions {
   height: 300px;
+}
+
+.small .directions {
+  height: 280px;
 }
 
 .direction {
