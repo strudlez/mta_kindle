@@ -29,12 +29,16 @@
   padding-bottom: 20px;
 }
 
+.small .stationTitle {
+  padding-bottom: 5px;
+}
+
 .directions {
   height: 300px;
 }
 
 .small .directions {
-  height: 260px;
+  height: 250px;
 }
 
 .direction {
