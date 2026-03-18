@@ -126,3 +126,53 @@
   font-size: 30;
   padding: 10px;
 }
+
+#picker {
+  padding: 20px;
+}
+#pickerTitle {
+  font-size: 50px;
+  font-weight: bold;
+  text-align: center;
+  margin-bottom: 30px;
+}
+.picker-item {
+  font-size: 40px;
+  padding: 10px;
+  border-bottom: 3px solid #777;
+}
+.picker-item-name {
+  display: inline-block;
+  width: 60%;
+}
+.picker-item-btn {
+  display: inline-block;
+  width: 10%;
+  text-align: center;
+  font-size: 40px;
+  padding: 10px;
+  border: 2px solid #333;
+  margin-left: 10px;
+  background: #eee;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.picker-controls {
+  margin-top: 30px;
+  text-align: center;
+}
+#pickerSelect {
+  font-size: 40px;
+  width: 70%;
+  padding: 10px;
+  max-width: 100%;
+}
+.picker-btn {
+  font-size: 40px;
+  padding: 10px 20px;
+  margin: 10px;
+  border: 3px solid #333;
+  background: #eee;
+  cursor: pointer;
+}

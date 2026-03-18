@@ -8,7 +8,7 @@
     <div class="body" id="main">
       <div id="stations">
         <div id="station0" class="hidden">
-          <div class="stationTitle"></div>
+          <div class="stationTitle" onclick="showPicker()" style="cursor: pointer;"></div>
           <div class="directions">
             <div class="inbound direction">
               <div class="inboundTitle"></div>
@@ -56,6 +56,21 @@
       <div class="alerts2 hidden">
         <div class="alertsTitle">Alerts </div>
         <div class="alertsBody"></div>
+      </div>
+    </div>
+    
+    <div class="body hidden" id="picker">
+      <div id="pickerTitle">Manage Stations</div>
+      <div id="pickerList"></div>
+      <div class="picker-controls">
+        <select id="pickerSelect">
+          <option value="">Select a station...</option>
+        </select>
+        <button class="picker-btn" onclick="addStation()">Add</button>
+      </div>
+      <div class="picker-controls">
+        <button class="picker-btn" onclick="savePicker()">Save</button>
+        <button class="picker-btn" onclick="hidePicker()">Cancel</button>
       </div>
     </div>
   </body>
