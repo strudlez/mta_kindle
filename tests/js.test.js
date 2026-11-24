@@ -136,6 +136,18 @@ class MockElement {
     }
     return null;
   }
+
+  querySelectorAll(selector) {
+    const cls = selector.startsWith('.') ? selector.slice(1) : null;
+    const results = [];
+    for (const child of this.children) {
+      if (cls && child.classList.contains(cls)) {
+        results.push(child);
+      }
+      results.push(...child.querySelectorAll(selector));
+    }
+    return results;
+  }
 }
 
 function buildStationTemplate() {
@@ -190,10 +202,24 @@ function setupEnvironment(locationOpts = {}) {
   const main = new MockElement('div');
   main.id = 'main';
   main.className = 'body';
+  const offlineBanner = new MockElement('div');
+  offlineBanner.id = 'offlineBanner';
+  offlineBanner.className = 'hidden';
+  const offlineAge = new MockElement('span');
+  offlineAge.id = 'offlineAge';
+  offlineBanner.appendChild(offlineAge);
+  main.appendChild(offlineBanner);
+  const editBtn = new MockElement('button');
+  editBtn.id = 'editStationsBtn';
+  main.appendChild(editBtn);
   const stations = new MockElement('div');
   stations.id = 'stations';
   stations.appendChild(buildStationTemplate());
   main.appendChild(stations);
+  const offlineEmpty = new MockElement('div');
+  offlineEmpty.id = 'offlineEmpty';
+  offlineEmpty.className = 'hidden';
+  main.appendChild(offlineEmpty);
 
   for (const cls of ['alerts', 'alerts2']) {
     const a = new MockElement('div');
@@ -210,21 +236,29 @@ function setupEnvironment(locationOpts = {}) {
   const picker = new MockElement('div');
   picker.id = 'picker';
   picker.className = 'body hidden';
+  const pickerManage = new MockElement('div');
+  pickerManage.id = 'pickerManage';
   const pickerList = new MockElement('div');
   pickerList.id = 'pickerList';
-  const pickerSelect = new MockElement('select');
-  pickerSelect.id = 'pickerSelect';
-  const addBtn = new MockElement('button');
-  addBtn.id = 'addStationBtn';
   const saveBtn = new MockElement('button');
   saveBtn.id = 'savePickerBtn';
   const hideBtn = new MockElement('button');
   hideBtn.id = 'hidePickerBtn';
-  picker.appendChild(pickerList);
-  picker.appendChild(pickerSelect);
-  picker.appendChild(addBtn);
-  picker.appendChild(saveBtn);
-  picker.appendChild(hideBtn);
+  pickerManage.appendChild(pickerList);
+  pickerManage.appendChild(saveBtn);
+  pickerManage.appendChild(hideBtn);
+
+  const pickerBrowse = new MockElement('div');
+  pickerBrowse.id = 'pickerBrowse';
+  const pickerStepHeader = new MockElement('div');
+  pickerStepHeader.id = 'pickerStepHeader';
+  const pickerStepBody = new MockElement('div');
+  pickerStepBody.id = 'pickerStepBody';
+  pickerBrowse.appendChild(pickerStepHeader);
+  pickerBrowse.appendChild(pickerStepBody);
+
+  picker.appendChild(pickerManage);
+  picker.appendChild(pickerBrowse);
 
   root.appendChild(main);
   root.appendChild(picker);
@@ -295,15 +329,22 @@ function setupEnvironment(locationOpts = {}) {
     root,
     mockWindow,
     mockDocument,
+    main,
+    stations,
+    offlineBanner,
+    offlineAge,
+    offlineEmpty,
+    editBtn,
+    pickerManage,
     pickerList,
-    pickerSelect,
+    pickerStepHeader,
+    pickerStepBody,
   };
 }
 
 describe('Kindle Compatibility & Static Checks', () => {
   test('js.js uses strictly ES5 syntax', () => {
     const raw = fs.readFileSync(JS_PATH, 'utf8');
-    // Strip comments before scanning
     const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
     expect(code).not.toMatch(/\b(const|let|class|async|await)\b/);
     expect(code).not.toMatch(/=>/);
@@ -356,20 +397,60 @@ describe('Frontend Logic, Security & Performance', () => {
     expect(env.app.getState().extraTrain).toBe('');
   });
 
-  test('stops.txt is lazy-loaded only on first showPicker() and cached', () => {
-    // Initial load fires countdown + alert2 only, NOT stops.txt
+  test('naturalCmp sorts street numbers numerically (14 < 18 < 96 < 103 < 116)', () => {
+    const names = ['116 St', '14 St', '103 St', '96 St', '18 St', 'Times Sq-42 St', '28 St'];
+    names.sort(env.app.naturalCmp);
+    expect(names).toEqual(['14 St', '18 St', '28 St', '96 St', '103 St', '116 St', 'Times Sq-42 St']);
+  });
+
+  test('3-step picker lazy-loads stops.txt once, skips single-borough step, and renders natural order', () => {
     expect(env.xhrRequests.some((r) => r.url.includes('stops.txt'))).toBe(false);
 
-    env.app.showPicker();
+    env.editBtn.dispatchClick();
+    expect(env.app.getState().pickerOpen).toBe(true);
     const stopReqs = env.xhrRequests.filter((r) => r.url.includes('stops.txt'));
     expect(stopReqs.length).toBe(1);
 
     stopReqs[0].status = 200;
-    stopReqs[0].responseText = 'stop_id,stop_name\nL08,Bedford Av\nA32,W 4 St\n';
+    stopReqs[0].responseText = [
+      'stop_id,stop_name,borough,routes',
+      'L08,Bedford Av,Bk,L',
+      'L13,Montrose Av,Bk,L',
+      '127,Times Sq-42 St,M,1 2 3',
+      '120,96 St,M,1 2 3',
+      '119,103 St,M,1',
+      '725,Times Sq-42 St,M,7',
+      '701,Flushing-Main St,Q,7',
+      'G30,Broadway,Bk,G',
+    ].join('\n');
     stopReqs[0].onload();
 
     expect(env.app.getState().stopsLoaded).toBe(true);
-    expect(env.pickerSelect.children.length).toBe(3); // default + 2 stops
+    expect(env.app.getState().pickerStep).toBe('lines');
+    expect(env.pickerStepBody.querySelectorAll('.line-btn').length).toBe(23);
+
+    // Line L serves only Bk in fixture -> auto-skips borough step straight to stations
+    env.app.selectLine('L');
+    expect(env.app.getState().pickerStep).toBe('stations');
+    expect(env.app.getState().selectedBoro).toBe('Bk');
+    expect(env.pickerManage.classList.contains('hidden')).toBe(true);
+
+    // Line 7 serves M and Q -> shows borough step
+    env.app.selectLine('7');
+    expect(env.app.getState().pickerStep).toBe('boroughs');
+    expect(env.pickerStepBody.querySelectorAll('.boro-card').length).toBe(2);
+
+    // Line 1 in Manhattan sorts 96 St before 103 St before Times Sq-42 St
+    env.app.selectLine('1');
+    env.app.selectBorough('M');
+    const tiles = env.pickerStepBody.querySelectorAll('.station-opt').map((el) => el.textContent);
+    expect(tiles).toEqual(['96 St', '103 St', 'Times Sq-42 St']);
+
+    // Adding station resets to lines step and shows pickerManage
+    env.app.addStationById('127');
+    expect(env.app.getState().currentPickerStations).toEqual(['L08', '127']);
+    expect(env.app.getState().pickerStep).toBe('lines');
+    expect(env.pickerManage.classList.contains('hidden')).toBe(false);
 
     // Reopening picker does not re-fetch stops.txt
     env.app.hidePicker();
@@ -472,7 +553,6 @@ describe('Frontend Logic, Security & Performance', () => {
     thirdBatch.onload();
     expect(env.app.getState().batchSupported).toBe(false);
 
-    // First staggered step requests only station 0 (not station 1 or alert2 yet)
     const after404 = env.xhrRequests.slice(3);
     expect(after404.map((r) => r.url)).toEqual(['/mta/countdown/L08']);
     after404[0].status = 200;
@@ -484,7 +564,6 @@ describe('Frontend Logic, Security & Performance', () => {
     });
     after404[0].onload();
 
-    // Run stagger timer -> triggers station 1 with ?alerts=0
     const pendingStagger = env.timers.filter((t) => !t.cleared && t.delay === 500);
     expect(pendingStagger.length).toBe(1);
     pendingStagger[0].fn();
@@ -495,18 +574,15 @@ describe('Frontend Logic, Security & Performance', () => {
     const firstBatch = env.xhrRequests[0];
     expect(firstBatch.aborted).toBe(false);
 
-    // Next poll tick aborts the still-pending first request
     env.app.refreshAll();
     expect(firstBatch.aborted).toBe(true);
 
-    // 15s watchdog timer aborts hung second request
     const secondBatch = env.xhrRequests[1];
     const watchdog = env.timers.find((t) => !t.cleared && t.delay === 15000);
     expect(watchdog).toBeDefined();
     watchdog.fn();
     expect(secondBatch.aborted).toBe(true);
 
-    // Safe 6h periodic reload: skipped while picker is open, fires when closed after healthy response
     env.app.setState({
       pageLoadedAt: Date.now() - 7 * 60 * 60 * 1000,
       pickerOpen: true,
@@ -526,7 +602,6 @@ describe('Frontend Logic, Security & Performance', () => {
   test('handles closed stations, non-200 status, malformed JSON, and hashChange safely', () => {
     const batchReq = env.xhrRequests.find((r) => r.url.startsWith('/mta/batch'));
 
-    // Non-200 (502) and malformed JSON do not throw
     batchReq.status = 502;
     batchReq.responseText = 'Bad Gateway';
     expect(() => batchReq.onload()).not.toThrow();
@@ -537,7 +612,6 @@ describe('Frontend Logic, Security & Performance', () => {
     batchReq2.responseText = '{bad json';
     expect(() => batchReq2.onload()).not.toThrow();
 
-    // Closed station hides all rows cleanly
     env.app.loadTimes('L08', env.root.querySelector('#station0'), true);
     const cdReq = env.xhrRequests[env.xhrRequests.length - 1];
     cdReq.status = 200;
@@ -552,9 +626,223 @@ describe('Frontend Logic, Security & Performance', () => {
     expect(s0.querySelector('.inbound1').classList.contains('hidden')).toBe(true);
     expect(s0.querySelector('.outbound1').classList.contains('hidden')).toBe(true);
 
-    // hashChange updates stations without throwing
     env.mockWindow.location.hash = '#A32,901&F';
     expect(() => env.app.hashChange()).not.toThrow();
     expect(env.app.getState().stations).toEqual(['A32', '901']);
+  });
+
+  test('brief <5m outage ticks cached countdowns, drops past trains, quick-retries once at 15s, and hides banner', () => {
+    const t0 = Date.now();
+    const firstBatch = env.xhrRequests.find((r) => r.url.startsWith('/mta/batch'));
+    firstBatch.status = 200;
+    firstBatch.responseText = JSON.stringify({
+      stations: {
+        L08: {
+          name: 'Bedford Av',
+          alerts: [],
+          status: { status: 'Good Service', alerts: [] },
+          route_times: {
+            Manhattan: [
+              { seconds: 90, mins: 1, time: '11:01', estimated: false, train_name: 'L' },
+              { seconds: 210, mins: 3, time: '11:03', estimated: false, train_name: 'L' },
+              { seconds: 510, mins: 8, time: '11:08', estimated: false, train_name: 'L' },
+              { seconds: 810, mins: 13, time: '11:13', estimated: false, train_name: 'L' },
+            ],
+          },
+        },
+      },
+      extra_alert: null,
+    });
+    firstBatch.onload();
+
+    const s0 = env.root.querySelector('#station0');
+    expect(env.offlineBanner.classList.contains('hidden')).toBe(true);
+    expect(env.stations.classList.contains('stale')).toBe(false);
+    expect(s0.querySelector('.inbound1').querySelector('.countdown').textContent).toBe('1');
+    expect(s0.querySelector('.inbound2').querySelector('.countdown').textContent).toBe('3');
+    expect(s0.querySelector('.inbound3').querySelector('.countdown').textContent).toBe('8');
+
+    // Pin snapshot & lastSuccessAt to deterministic t0, then fail 1st poll at +60s (< 5m)
+    const snap = env.app.getState().lastStationSnapshots.L08;
+    snap.fetchedAt = t0;
+    env.app.setState({ lastSuccessAt: t0 });
+
+    env.app.markPollFailure(t0 + 60 * 1000);
+    expect(env.offlineBanner.classList.contains('hidden')).toBe(true);
+    expect(env.stations.classList.contains('stale')).toBe(false);
+    expect(s0.querySelector('.inbound1').querySelector('.countdown').textContent).toBe('0');
+    expect(s0.querySelector('.inbound2').querySelector('.countdown').textContent).toBe('2');
+    expect(s0.querySelector('.inbound3').querySelector('.countdown').textContent).toBe('7');
+
+    // Exactly one 15s quick-retry timer is scheduled on the 1st failure
+    const quickRetries = env.timers.filter((t) => !t.cleared && t.delay === 15000);
+    expect(quickRetries.length).toBe(1);
+    const reqCountBefore = env.xhrRequests.length;
+    quickRetries[0].fn();
+    expect(env.xhrRequests.length).toBe(reqCountBefore + 1);
+    expect(env.xhrRequests[env.xhrRequests.length - 1].url).toBe('/mta/batch?stations=L08&extra=4');
+
+    // 2nd consecutive failure at +120s (< 5m): 90s train dropped, 4th train promoted, no extra quick-retry
+    const timersBefore2ndFail = env.timers.length;
+    const failedRetry = env.xhrRequests[env.xhrRequests.length - 1];
+    failedRetry.status = 502;
+    failedRetry.onload();
+    env.app.markPollFailure(t0 + 120 * 1000);
+    expect(env.offlineBanner.classList.contains('hidden')).toBe(true);
+    expect(env.stations.classList.contains('stale')).toBe(false);
+    expect(s0.querySelector('.inbound1').querySelector('.countdown').textContent).toBe('1');
+    expect(s0.querySelector('.inbound1').querySelector('.realtime').textContent).toBe('11:03');
+    expect(s0.querySelector('.inbound2').querySelector('.countdown').textContent).toBe('6');
+    expect(s0.querySelector('.inbound3').querySelector('.countdown').textContent).toBe('11');
+    expect(s0.querySelector('.inbound3').querySelector('.realtime').textContent).toBe('11:13');
+    const newActiveRetries = env.timers.slice(timersBefore2ndFail).filter((t) => !t.cleared && t.delay === 15000);
+    expect(newActiveRetries.length).toBe(0);
+  });
+
+  test('5+ min outage shows offline banner, coarse dirty-checked age, dims and drops past trains, exhausts cleanly, and auto-recovers', () => {
+    expect(env.app.formatOfflineAge(4 * 60 * 1000)).toBe('');
+    expect(env.app.formatOfflineAge(5 * 60 * 1000)).toBe('· 5m+ ago');
+    expect(env.app.formatOfflineAge(9 * 60 * 1000)).toBe('· 5m+ ago');
+    expect(env.app.formatOfflineAge(10 * 60 * 1000)).toBe('· 10m+ ago');
+    expect(env.app.formatOfflineAge(15 * 60 * 1000)).toBe('· 15m+ ago');
+    expect(env.app.formatOfflineAge(30 * 60 * 1000)).toBe('· 30m+ ago');
+    expect(env.app.formatOfflineAge(60 * 60 * 1000)).toBe('· 1h+ ago');
+    expect(env.app.formatOfflineAge(135 * 60 * 1000)).toBe('· 2h+ ago');
+
+    const t0 = Date.now();
+    const firstBatch = env.xhrRequests.find((r) => r.url.startsWith('/mta/batch'));
+    firstBatch.status = 200;
+    firstBatch.responseText = JSON.stringify({
+      stations: {
+        L08: {
+          name: 'Bedford Av',
+          alerts: [],
+          status: { status: 'Good Service', alerts: [] },
+          route_times: {
+            Manhattan: [
+              { seconds: 150, mins: 2, time: '11:02', estimated: false, train_name: 'L' },
+              { seconds: 630, mins: 10, time: '11:10', estimated: false, train_name: 'L' },
+            ],
+          },
+        },
+      },
+      extra_alert: null,
+    });
+    firstBatch.onload();
+
+    const s0 = env.root.querySelector('#station0');
+    env.app.getState().lastStationSnapshots.L08.fetchedAt = t0;
+    env.app.setState({ lastSuccessAt: t0 });
+
+    // At +6m offline: banner visible, dimmed stale state, 150s train dropped, 630s train ticked to 4m
+    env.app.markPollFailure(t0 + 6 * 60 * 1000);
+    expect(env.offlineBanner.classList.contains('hidden')).toBe(false);
+    expect(env.offlineAge.textContent).toBe('· 5m+ ago');
+    expect(env.main.classList.contains('is-offline')).toBe(true);
+    expect(env.stations.classList.contains('stale')).toBe(true);
+    expect(env.offlineEmpty.classList.contains('hidden')).toBe(true);
+    expect(env.stations.classList.contains('hidden')).toBe(false);
+    expect(s0.querySelector('.inbound1').querySelector('.countdown').textContent).toBe('4');
+    expect(s0.querySelector('.inbound1').querySelector('.realtime').textContent).toBe('11:10');
+    expect(s0.querySelector('.inbound2').classList.contains('hidden')).toBe(true);
+
+    // At +7m offline: same 5m+ bucket skips redundant offlineAge textContent write
+    const ageWrites = env.offlineAge.textWrites;
+    env.app.markPollFailure(t0 + 7 * 60 * 1000);
+    expect(env.offlineAge.textWrites).toBe(ageWrites);
+    expect(s0.querySelector('.inbound1').querySelector('.countdown').textContent).toBe('3');
+
+    // At +12m offline: all cached trains have passed -> stations hide and offlineEmpty shows
+    env.app.markPollFailure(t0 + 12 * 60 * 1000);
+    expect(env.offlineAge.textContent).toBe('· 10m+ ago');
+    expect(env.app.getState().cachedTrainsExhausted).toBe(true);
+    expect(env.stations.classList.contains('hidden')).toBe(true);
+    expect(env.offlineEmpty.classList.contains('hidden')).toBe(false);
+
+    // Auto-recovery on next successful poll
+    env.app.refreshAll();
+    const recoveredBatch = env.xhrRequests[env.xhrRequests.length - 1];
+    recoveredBatch.status = 200;
+    recoveredBatch.responseText = JSON.stringify({
+      stations: {
+        L08: {
+          name: 'Bedford Av',
+          alerts: [],
+          status: { status: 'Good Service', alerts: [] },
+          route_times: {
+            Manhattan: [{ seconds: 240, mins: 4, time: '11:16', estimated: false, train_name: 'L' }],
+          },
+        },
+      },
+      extra_alert: null,
+    });
+    recoveredBatch.onload();
+
+    expect(env.offlineBanner.classList.contains('hidden')).toBe(true);
+    expect(env.offlineEmpty.classList.contains('hidden')).toBe(true);
+    expect(env.stations.classList.contains('hidden')).toBe(false);
+    expect(env.main.classList.contains('is-offline')).toBe(false);
+    expect(env.stations.classList.contains('stale')).toBe(false);
+    expect(env.app.getState().consecutiveFailures).toBe(0);
+    expect(s0.querySelector('.inbound1').querySelector('.countdown').textContent).toBe('4');
+  });
+
+  test('initial-load failure shows offline banner and empty message immediately, and staggered fallback tracks failures', () => {
+    const firstBatch = env.xhrRequests.find((r) => r.url.startsWith('/mta/batch'));
+    firstBatch.status = 502;
+    firstBatch.onload();
+
+    expect(env.offlineBanner.classList.contains('hidden')).toBe(false);
+    expect(env.offlineAge.textContent).toBe('');
+    expect(env.offlineEmpty.classList.contains('hidden')).toBe(false);
+    expect(env.stations.classList.contains('hidden')).toBe(true);
+    expect(env.main.classList.contains('is-offline')).toBe(true);
+
+    // 15s quick-retry runs next
+    const retryTimer = env.timers.find((t) => !t.cleared && t.delay === 15000);
+    expect(retryTimer).toBeDefined();
+    retryTimer.fn();
+
+    // Test 404 staggered fallback failing then succeeding
+    const batch404 = env.xhrRequests[env.xhrRequests.length - 1];
+    batch404.status = 404;
+    batch404.onload();
+    expect(env.app.getState().batchSupported).toBe(false);
+
+    const cdFail = env.xhrRequests[env.xhrRequests.length - 1];
+    cdFail.status = 502;
+    cdFail.onload();
+    const staggerStep = env.timers.find((t) => !t.cleared && t.delay === 500);
+    expect(staggerStep).toBeDefined();
+    staggerStep.fn();
+    const alertFail = env.xhrRequests[env.xhrRequests.length - 1];
+    alertFail.status = 502;
+    alertFail.onload();
+    expect(env.offlineBanner.classList.contains('hidden')).toBe(false);
+
+    // Next staggered cycle succeeds -> clears offline state
+    env.app.refreshAll();
+    const cdOk = env.xhrRequests[env.xhrRequests.length - 1];
+    cdOk.status = 200;
+    cdOk.responseText = JSON.stringify({
+      name: 'Bedford Av',
+      alerts: [],
+      status: { status: 'Good Service', alerts: [] },
+      route_times: {
+        Manhattan: [{ seconds: 180, mins: 3, time: '11:03', estimated: false, train_name: 'L' }],
+      },
+    });
+    cdOk.onload();
+    const staggerStep2 = env.timers.filter((t) => !t.cleared && t.delay === 500).pop();
+    staggerStep2.fn();
+    const alertOk = env.xhrRequests[env.xhrRequests.length - 1];
+    alertOk.status = 200;
+    alertOk.responseText = JSON.stringify({ status: 'Good Service', alerts: [] });
+    alertOk.onload();
+
+    expect(env.offlineBanner.classList.contains('hidden')).toBe(true);
+    expect(env.offlineEmpty.classList.contains('hidden')).toBe(true);
+    expect(env.stations.classList.contains('hidden')).toBe(false);
+    expect(env.main.classList.contains('is-offline')).toBe(false);
   });
 });

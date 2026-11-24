@@ -5,10 +5,13 @@
   var EXTRA_TRAIN = '4';
   var ALL_STATIONS = [];
   var ALL_STATIONS_MAP = {};
+  var STOPS_BY_LINE_BORO = {};
   var currentPickerStations = [];
   var stopsLoaded = false;
   var stopsLoading = false;
-  var selectPopulated = false;
+  var pickerStep = 'lines';
+  var selectedLine = '';
+  var selectedBoro = '';
   var stationTemplate = null;
   var stationRefs = [];
 
@@ -16,12 +19,33 @@
   var STAGGER_DELAY_MS = 500;
   var POLL_INTERVAL_MS = 60000;
   var RELOAD_INTERVAL_MS = 6 * 60 * 60 * 1000;
+  var OFFLINE_BANNER_MS = 5 * 60 * 1000;
+  var QUICK_RETRY_DELAY_MS = 15000;
 
   var pageLoadedAt = (new Date()).getTime();
   var pickerOpen = false;
   var batchSupported = true;
   var staggerTimer = null;
+  var quickRetryTimer = null;
   var inFlightRequests = {};
+  var lastSuccessAt = 0;
+  var consecutiveFailures = 0;
+  var lastStationSnapshots = {};
+  var cachedTrainsExhausted = false;
+
+  var LINE_ROWS = [
+    ['1', '2', '3', '4', '5', '6', '7'],
+    ['A', 'C', 'E', 'B', 'D', 'F', 'M'],
+    ['G', 'J', 'Z', 'L', 'N', 'Q', 'R'],
+    ['W', 'S']
+  ];
+  var BORO_ORDER = ['M', 'Bk', 'Q', 'Bx'];
+  var BORO_NAMES = {
+    M: 'Manhattan',
+    Bk: 'Brooklyn',
+    Q: 'Queens',
+    Bx: 'Bronx'
+  };
 
   var TRAIN_COLOR_CLASSES = [
     'train-color-default',
@@ -57,6 +81,26 @@
     return typeof id === 'string' && /^[A-Z0-9]{1,2}$/.test(id);
   }
 
+  function naturalCmp(a, b) {
+    var sa = (typeof a === 'string' ? a : (a && a.name ? a.name : '')).toLowerCase();
+    var sb = (typeof b === 'string' ? b : (b && b.name ? b.name : '')).toLowerCase();
+    var re = /(\d+|\D+)/g;
+    var ta = sa.match(re) || [];
+    var tb = sb.match(re) || [];
+    var len = ta.length < tb.length ? ta.length : tb.length;
+    for (var i = 0; i < len; i++) {
+      if (ta[i] === tb[i]) continue;
+      var na = /^\d+$/.test(ta[i]);
+      var nb = /^\d+$/.test(tb[i]);
+      if (na && nb) {
+        var diff = parseInt(ta[i], 10) - parseInt(tb[i], 10);
+        if (diff !== 0) return diff;
+      }
+      return ta[i] < tb[i] ? -1 : 1;
+    }
+    return ta.length - tb.length;
+  }
+
   function setText(el, val) {
     if (!el) return;
     var str = (val === null || val === undefined) ? '' : String(val);
@@ -85,11 +129,182 @@
     }
   }
 
+  function clearChildren(el) {
+    if (!el) return;
+    while (el.firstChild) {
+      el.removeChild(el.firstChild);
+    }
+  }
+
   function clearStaggerTimer() {
     if (staggerTimer !== null && typeof window.clearTimeout === 'function') {
       window.clearTimeout(staggerTimer);
     }
     staggerTimer = null;
+  }
+
+  function clearQuickRetryTimer() {
+    if (quickRetryTimer !== null && typeof window.clearTimeout === 'function') {
+      window.clearTimeout(quickRetryTimer);
+    }
+    quickRetryTimer = null;
+  }
+
+  function scheduleQuickRetry() {
+    clearQuickRetryTimer();
+    if (typeof window.setTimeout === 'function') {
+      quickRetryTimer = window.setTimeout(function() {
+        quickRetryTimer = null;
+        refreshAll();
+      }, QUICK_RETRY_DELAY_MS);
+    }
+  }
+
+  function formatOfflineAge(elapsedMs) {
+    if (typeof elapsedMs !== 'number' || elapsedMs < OFFLINE_BANNER_MS) return '';
+    var mins = Math.floor(elapsedMs / 60000);
+    if (mins < 10) return '\u00b7 5m+ ago';
+    if (mins < 15) return '\u00b7 10m+ ago';
+    if (mins < 30) return '\u00b7 15m+ ago';
+    if (mins < 60) return '\u00b7 30m+ ago';
+    return '\u00b7 ' + Math.floor(mins / 60) + 'h+ ago';
+  }
+
+  function saveStationSnapshot(station, js, nowMs) {
+    if (!station || !js) return;
+    lastStationSnapshots[station] = {
+      data: js,
+      fetchedAt: typeof nowMs === 'number' ? nowMs : (new Date()).getTime()
+    };
+  }
+
+  function projectStationData(snap, nowMs) {
+    var elapsedSec = Math.floor((nowMs - snap.fetchedAt) / 1000);
+    if (elapsedSec < 0) elapsedSec = 0;
+
+    var src = snap.data || {};
+    var srcRoutes = src.route_times || {};
+    var outRoutes = {};
+    var origCount = 0;
+    var remainingCount = 0;
+
+    for (var route in srcRoutes) {
+      if (!Object.prototype.hasOwnProperty.call(srcRoutes, route)) continue;
+      var list = srcRoutes[route] || [];
+      var kept = [];
+      for (var i = 0; i < list.length; i++) {
+        var t = list[i];
+        if (!t) continue;
+        origCount++;
+        if (typeof t.seconds === 'number') {
+          var rem = t.seconds - elapsedSec;
+          if (rem < 0) continue;
+          kept.push({
+            seconds: rem,
+            mins: Math.floor(rem / 60),
+            time: t.time,
+            estimated: t.estimated,
+            train_name: t.train_name
+          });
+          remainingCount++;
+        } else {
+          kept.push(t);
+          remainingCount++;
+        }
+      }
+      outRoutes[route] = kept;
+    }
+
+    return {
+      data: {
+        name: src.name,
+        alerts: src.alerts,
+        status: src.status,
+        route_times: outRoutes
+      },
+      origCount: origCount,
+      remainingCount: remainingCount
+    };
+  }
+
+  function tickCachedCountdowns(nowMs) {
+    var now = typeof nowMs === 'number' ? nowMs : (new Date()).getTime();
+    var totalOrig = 0;
+    var totalRemaining = 0;
+
+    for (var j = 0; j < STATIONS.length; j++) {
+      var st = STATIONS[j];
+      var snap = lastStationSnapshots[st];
+      var refs = stationRefs[j] || cacheStationRefs(document.getElementById('station' + j));
+      if (snap && refs && refs.root) {
+        var projected = projectStationData(snap, now);
+        totalOrig += projected.origCount;
+        totalRemaining += projected.remainingCount;
+        renderStationData(st, refs, projected.data, false);
+      }
+    }
+
+    cachedTrainsExhausted = (totalOrig > 0 && totalRemaining === 0);
+    return totalRemaining;
+  }
+
+  function updateOfflineUi(nowMs) {
+    var now = typeof nowMs === 'number' ? nowMs : (new Date()).getTime();
+    var mainEl = document.getElementById('main');
+    var stationsEl = document.getElementById('stations');
+    var bannerEl = document.getElementById('offlineBanner');
+    var ageEl = document.getElementById('offlineAge');
+    var emptyEl = document.getElementById('offlineEmpty');
+
+    var isInitialOffline = (lastSuccessAt === 0 && consecutiveFailures > 0);
+    var elapsed = lastSuccessAt > 0 ? (now - lastSuccessAt) : 0;
+    var isExtendedOffline = (lastSuccessAt > 0 && consecutiveFailures > 0 && elapsed >= OFFLINE_BANNER_MS);
+    var showBanner = isInitialOffline || isExtendedOffline;
+    var showEmpty = isInitialOffline || (isExtendedOffline && cachedTrainsExhausted);
+
+    setHidden(bannerEl, !showBanner);
+    setHidden(emptyEl, !showEmpty);
+    setHidden(stationsEl, showEmpty);
+
+    if (mainEl) {
+      if (showBanner && !mainEl.classList.contains('is-offline')) {
+        mainEl.classList.add('is-offline');
+      } else if (!showBanner && mainEl.classList.contains('is-offline')) {
+        mainEl.classList.remove('is-offline');
+      }
+    }
+
+    if (stationsEl) {
+      var shouldStale = isExtendedOffline && !showEmpty;
+      if (shouldStale && !stationsEl.classList.contains('stale')) {
+        stationsEl.classList.add('stale');
+      } else if (!shouldStale && stationsEl.classList.contains('stale')) {
+        stationsEl.classList.remove('stale');
+      }
+    }
+
+    setText(ageEl, isExtendedOffline ? formatOfflineAge(elapsed) : '');
+  }
+
+  function markPollSuccess(nowMs) {
+    var now = typeof nowMs === 'number' ? nowMs : (new Date()).getTime();
+    clearQuickRetryTimer();
+    consecutiveFailures = 0;
+    cachedTrainsExhausted = false;
+    lastSuccessAt = now;
+    updateOfflineUi(now);
+  }
+
+  function markPollFailure(nowMs) {
+    var now = typeof nowMs === 'number' ? nowMs : (new Date()).getTime();
+    consecutiveFailures += 1;
+    if (consecutiveFailures === 1) {
+      scheduleQuickRetry();
+    }
+    if (lastSuccessAt > 0) {
+      tickCachedCountdowns(now);
+    }
+    updateOfflineUi(now);
   }
 
   function abortRequest(slot) {
@@ -199,27 +414,31 @@
     return false;
   }
 
-  function populateSelectOptions() {
-    if (selectPopulated || !stopsLoaded) return;
-    var select = document.getElementById('pickerSelect');
-    if (!select) return;
-    while (select.firstChild) {
-      select.removeChild(select.firstChild);
+  function indexStops(list) {
+    var map = {};
+    var byLineBoro = {};
+    for (var i = 0; i < list.length; i++) {
+      var st = list[i];
+      map[st.id] = st;
+      var rts = st.routes || [];
+      for (var r = 0; r < rts.length; r++) {
+        var line = rts[r];
+        if (!byLineBoro[line]) byLineBoro[line] = {};
+        var boro = st.borough || 'Other';
+        if (!byLineBoro[line][boro]) byLineBoro[line][boro] = [];
+        byLineBoro[line][boro].push(st);
+      }
     }
-    var frag = document.createDocumentFragment();
-    var defaultOpt = document.createElement('option');
-    defaultOpt.value = '';
-    defaultOpt.textContent = 'Select a station...';
-    frag.appendChild(defaultOpt);
-
-    for (var i = 0; i < ALL_STATIONS.length; i++) {
-      var opt = document.createElement('option');
-      opt.value = ALL_STATIONS[i].id;
-      opt.textContent = ALL_STATIONS[i].name;
-      frag.appendChild(opt);
+    for (var ln in byLineBoro) {
+      if (!Object.prototype.hasOwnProperty.call(byLineBoro, ln)) continue;
+      for (var br in byLineBoro[ln]) {
+        if (Object.prototype.hasOwnProperty.call(byLineBoro[ln], br)) {
+          byLineBoro[ln][br].sort(naturalCmp);
+        }
+      }
     }
-    select.appendChild(frag);
-    selectPopulated = true;
+    ALL_STATIONS_MAP = map;
+    STOPS_BY_LINE_BORO = byLineBoro;
   }
 
   function loadStops(callback) {
@@ -243,32 +462,31 @@
 
       var lines = xhttp.responseText.split('\n');
       var parsed = [];
-      var map = {};
       for (var i = 1; i < lines.length; i++) {
         var line = trimStr(lines[i]);
         if (!line) continue;
-        var commaIdx = line.indexOf(',');
-        if (commaIdx > -1) {
-          var id = trimStr(line.substring(0, commaIdx));
-          var rawName = trimStr(line.substring(commaIdx + 1));
-          if (!isValidStation(id)) continue;
-          var trainLine = id.charAt(0);
-          var displayName = rawName + ' (' + trainLine + ')';
-          parsed.push({ id: id, name: displayName });
-          map[id] = displayName;
-        }
+        var parts = line.split(',');
+        if (parts.length < 2) continue;
+        var id = trimStr(parts[0]);
+        var rawName = trimStr(parts[1]);
+        if (!isValidStation(id)) continue;
+        var boro = parts.length >= 3 ? trimStr(parts[2]) : '';
+        var routesStr = parts.length >= 4 ? trimStr(parts[3]) : id.charAt(0);
+        var routeTokens = routesStr ? routesStr.split(/\s+/) : [id.charAt(0)];
+        parsed.push({
+          id: id,
+          name: rawName,
+          borough: boro,
+          routes: routeTokens
+        });
       }
-      parsed.sort(function(a, b) {
-        if (a.name < b.name) return -1;
-        if (a.name > b.name) return 1;
-        return 0;
-      });
       ALL_STATIONS = parsed;
-      ALL_STATIONS_MAP = map;
+      indexStops(parsed);
       stopsLoaded = true;
-      selectPopulated = false;
-      populateSelectOptions();
-      drawPickerList();
+      if (pickerOpen) {
+        drawPickerList();
+        drawPickerStep();
+      }
       if (callback) callback();
     };
     xhttp.onerror = function() {
@@ -282,15 +500,17 @@
 
   function showPicker() {
     pickerOpen = true;
+    pickerStep = 'lines';
+    selectedLine = '';
+    selectedBoro = '';
     setHidden(document.getElementById('main'), true);
     setHidden(document.getElementById('picker'), false);
 
     currentPickerStations = STATIONS.slice();
     drawPickerList();
+    drawPickerStep();
 
-    if (stopsLoaded) {
-      populateSelectOptions();
-    } else {
+    if (!stopsLoaded) {
       loadStops();
     }
   }
@@ -301,56 +521,268 @@
     setHidden(document.getElementById('main'), false);
   }
 
-  function makePickerBtn(label, index, handler) {
+  function makeIconBtn(label, extraClass, handler) {
     var btn = document.createElement('span');
-    btn.className = 'picker-item-btn';
+    btn.className = extraClass ? ('icon-btn ' + extraClass) : 'icon-btn';
     btn.textContent = label;
-    btn.addEventListener('click', function() {
-      handler(index);
-    });
+    btn.addEventListener('click', handler);
     return btn;
   }
 
   function drawPickerList() {
     var pickerList = document.getElementById('pickerList');
     if (!pickerList) return;
-    while (pickerList.firstChild) {
-      pickerList.removeChild(pickerList.firstChild);
-    }
+    clearChildren(pickerList);
 
     var frag = document.createDocumentFragment();
     for (var i = 0; i < currentPickerStations.length; i++) {
       var id = currentPickerStations[i];
-      var name = ALL_STATIONS_MAP[id] || id;
+      var info = ALL_STATIONS_MAP[id];
+      var name = info ? info.name : id;
+      var routes = info && info.routes ? info.routes : [id.charAt(0)];
 
       var row = document.createElement('div');
       row.className = 'picker-item';
 
+      var left = document.createElement('span');
+      left.className = 'picker-item-left';
+      for (var r = 0; r < routes.length; r++) {
+        var bullet = document.createElement('span');
+        bullet.className = 'mini-bullet ' + getTrainColorClass(routes[r]);
+        bullet.textContent = routes[r];
+        left.appendChild(bullet);
+      }
       var nameSpan = document.createElement('span');
       nameSpan.className = 'picker-item-name';
       nameSpan.textContent = name;
-      row.appendChild(nameSpan);
+      left.appendChild(nameSpan);
+      row.appendChild(left);
 
+      var actions = document.createElement('span');
+      actions.className = 'picker-item-actions';
       (function(idx) {
-        row.appendChild(makePickerBtn('\u25B2', idx, function(i2) { moveStation(i2, -1); }));
-        row.appendChild(makePickerBtn('\u25BC', idx, function(i2) { moveStation(i2, 1); }));
-        row.appendChild(makePickerBtn('X', idx, function(i2) { deleteStation(i2); }));
+        actions.appendChild(makeIconBtn('\u25B2', '', function() { moveStation(idx, -1); }));
+        actions.appendChild(makeIconBtn('\u25BC', '', function() { moveStation(idx, 1); }));
+        actions.appendChild(makeIconBtn('\u00D7', 'icon-btn-del', function() { deleteStation(idx); }));
       })(i);
+      row.appendChild(actions);
 
       frag.appendChild(row);
     }
     pickerList.appendChild(frag);
   }
 
-  function addStation() {
-    var select = document.getElementById('pickerSelect');
-    if (!select) return;
-    var val = select.value;
-    if (isValidStation(val)) {
-      currentPickerStations.push(val);
-      drawPickerList();
-      select.value = '';
+  function getLineBoroughs(line) {
+    var boroMap = STOPS_BY_LINE_BORO[line];
+    if (!boroMap) return [];
+    var out = [];
+    for (var i = 0; i < BORO_ORDER.length; i++) {
+      var b = BORO_ORDER[i];
+      if (boroMap[b] && boroMap[b].length > 0) {
+        out.push(b);
+      }
     }
+    for (var k in boroMap) {
+      if (Object.prototype.hasOwnProperty.call(boroMap, k) && BORO_ORDER.indexOf(k) === -1 && boroMap[k].length > 0) {
+        out.push(k);
+      }
+    }
+    return out;
+  }
+
+  function selectLine(line) {
+    selectedLine = line;
+    var boros = getLineBoroughs(line);
+    if (boros.length === 1) {
+      selectedBoro = boros[0];
+      pickerStep = 'stations';
+    } else {
+      selectedBoro = '';
+      pickerStep = 'boroughs';
+    }
+    drawPickerStep();
+  }
+
+  function selectBorough(boro) {
+    selectedBoro = boro;
+    pickerStep = 'stations';
+    drawPickerStep();
+  }
+
+  function addStationById(id) {
+    if (!isValidStation(id)) return;
+    currentPickerStations.push(id);
+    pickerStep = 'lines';
+    selectedLine = '';
+    selectedBoro = '';
+    drawPickerList();
+    drawPickerStep();
+  }
+
+  function makeStepHeader(line, titleText, backLabel, onBack) {
+    var bar = document.createElement('div');
+    bar.className = 'step-header';
+
+    var title = document.createElement('span');
+    title.className = 'step-title';
+    if (line) {
+      var bullet = document.createElement('span');
+      bullet.className = 'step-bullet ' + getTrainColorClass(line);
+      bullet.textContent = line;
+      title.appendChild(bullet);
+    }
+    var txt = document.createElement('span');
+    txt.className = 'step-title-text';
+    txt.textContent = titleText;
+    title.appendChild(txt);
+    bar.appendChild(title);
+
+    if (backLabel && onBack) {
+      var actions = document.createElement('span');
+      actions.className = 'mta-actions';
+      var backBtn = document.createElement('button');
+      backBtn.className = 'btn-secondary';
+      backBtn.type = 'button';
+      backBtn.textContent = backLabel;
+      backBtn.addEventListener('click', onBack);
+      actions.appendChild(backBtn);
+      bar.appendChild(actions);
+    }
+    return bar;
+  }
+
+  function drawPickerStep() {
+    var manageEl = document.getElementById('pickerManage');
+    var headerEl = document.getElementById('pickerStepHeader');
+    var bodyEl = document.getElementById('pickerStepBody');
+    if (!headerEl || !bodyEl) return;
+
+    clearChildren(headerEl);
+    clearChildren(bodyEl);
+
+    if (!stopsLoaded) {
+      setHidden(manageEl, false);
+      var loading = document.createElement('div');
+      loading.className = 'picker-status';
+      loading.textContent = 'Loading stations...';
+      bodyEl.appendChild(loading);
+      return;
+    }
+
+    if (pickerStep === 'lines') {
+      setHidden(manageEl, false);
+      var lbl = document.createElement('div');
+      lbl.className = 'section-label';
+      lbl.textContent = 'Add a station \u2014 pick a line';
+      headerEl.appendChild(lbl);
+
+      var grid = document.createElement('div');
+      grid.className = 'line-grid';
+      for (var r = 0; r < LINE_ROWS.length; r++) {
+        var rowDiv = document.createElement('div');
+        rowDiv.className = 'line-row';
+        var rowLines = LINE_ROWS[r];
+        for (var c = 0; c < rowLines.length; c++) {
+          (function(ln) {
+            var btn = document.createElement('span');
+            btn.className = 'line-btn ' + getTrainColorClass(ln);
+            btn.textContent = ln;
+            btn.addEventListener('click', function() {
+              selectLine(ln);
+            });
+            rowDiv.appendChild(btn);
+          })(rowLines[c]);
+        }
+        grid.appendChild(rowDiv);
+      }
+      bodyEl.appendChild(grid);
+      return;
+    }
+
+    if (pickerStep === 'boroughs') {
+      setHidden(manageEl, false);
+      var bLbl = document.createElement('div');
+      bLbl.className = 'section-label';
+      bLbl.textContent = 'Add a station \u2014 pick a borough';
+      headerEl.appendChild(bLbl);
+
+      var subBar = makeStepHeader(selectedLine, 'Line ' + selectedLine, '\u2190 Lines', function() {
+        pickerStep = 'lines';
+        selectedLine = '';
+        drawPickerStep();
+      });
+      subBar.className = 'mta-bar-sub';
+      headerEl.appendChild(subBar);
+
+      var boros = getLineBoroughs(selectedLine);
+      var boroFrag = document.createDocumentFragment();
+      for (var i = 0; i < boros.length; i++) {
+        (function(bCode) {
+          var list = STOPS_BY_LINE_BORO[selectedLine][bCode] || [];
+          var card = document.createElement('div');
+          card.className = 'boro-card';
+          card.textContent = BORO_NAMES[bCode] || bCode;
+
+          var meta = document.createElement('span');
+          meta.className = 'boro-meta';
+          meta.textContent = list.length + (list.length === 1 ? ' stop \u203A' : ' stops \u203A');
+          card.appendChild(meta);
+
+          card.addEventListener('click', function() {
+            selectBorough(bCode);
+          });
+          boroFrag.appendChild(card);
+        })(boros[i]);
+      }
+      bodyEl.appendChild(boroFrag);
+      return;
+    }
+
+    // Step 3: Full-screen 3-column natural-alphabetical station grid
+    setHidden(manageEl, true);
+    var multiBoro = getLineBoroughs(selectedLine).length > 1;
+    var backLabel = multiBoro ? '\u2190 Boroughs' : '\u2190 Lines';
+    var boroName = BORO_NAMES[selectedBoro] || selectedBoro;
+    headerEl.appendChild(makeStepHeader(selectedLine, boroName, backLabel, function() {
+      if (multiBoro) {
+        pickerStep = 'boroughs';
+        selectedBoro = '';
+      } else {
+        pickerStep = 'lines';
+        selectedLine = '';
+        selectedBoro = '';
+      }
+      drawPickerStep();
+    }));
+
+    var stationsList = (STOPS_BY_LINE_BORO[selectedLine] && STOPS_BY_LINE_BORO[selectedLine][selectedBoro]) || [];
+    var colsWrap = document.createElement('div');
+    colsWrap.className = 'station-cols';
+
+    for (var s = 0; s < stationsList.length; s++) {
+      (function(st, idx) {
+        var cell = document.createElement('div');
+        cell.className = ((idx + 1) % 3 === 0) ? 'station-cell station-cell-last' : 'station-cell';
+
+        var tile = document.createElement('div');
+        tile.className = 'station-opt';
+        tile.textContent = st.name;
+
+        if (st.routes && st.routes.length > 1) {
+          var tag = document.createElement('span');
+          tag.className = 'st-routes';
+          tag.textContent = ' (' + st.routes.join('/') + ')';
+          tile.appendChild(tag);
+        }
+
+        tile.addEventListener('click', function() {
+          addStationById(st.id);
+        });
+        cell.appendChild(tile);
+        colsWrap.appendChild(cell);
+      })(stationsList[s], s);
+    }
+    bodyEl.appendChild(colsWrap);
   }
 
   function moveStation(index, dir) {
@@ -508,9 +940,7 @@
     }
     if (!stationTemplate) return;
 
-    while (stationsContainer.firstChild) {
-      stationsContainer.removeChild(stationsContainer.firstChild);
-    }
+    clearChildren(stationsContainer);
     stationRefs = [];
 
     var frag = document.createDocumentFragment();
@@ -528,6 +958,13 @@
     } else {
       stationsContainer.classList.remove('small');
     }
+
+    clearQuickRetryTimer();
+    lastStationSnapshots = {};
+    lastSuccessAt = 0;
+    consecutiveFailures = 0;
+    cachedTrainsExhausted = false;
+    updateOfflineUi();
 
     refreshAll();
   }
@@ -674,6 +1111,7 @@
       reqSlot,
       url,
       function(js) {
+        saveStationSnapshot(station, js);
         renderStationData(station, refsOrEl, js, doAlert);
         if (onDone) onDone(true);
       },
@@ -766,11 +1204,17 @@
     }
 
     var anySucceeded = false;
+    function finishStaggered() {
+      if (anySucceeded) {
+        markPollSuccess();
+        maybePeriodicReload();
+      } else {
+        markPollFailure();
+      }
+    }
     function runStep(stepIdx) {
       if (stepIdx >= tasks.length) {
-        if (anySucceeded) {
-          maybePeriodicReload();
-        }
+        finishStaggered();
         return;
       }
       tasks[stepIdx](function(ok) {
@@ -784,8 +1228,8 @@
           } else {
             runStep(stepIdx + 1);
           }
-        } else if (anySucceeded) {
-          maybePeriodicReload();
+        } else {
+          finishStaggered();
         }
       });
     }
@@ -795,6 +1239,7 @@
 
   function refreshAll() {
     clearStaggerTimer();
+    clearQuickRetryTimer();
 
     if (!batchSupported) {
       startStaggeredFallback();
@@ -820,7 +1265,6 @@
       url += '&extra=' + encodeURIComponent(requestedExtra);
     }
 
-    // Abort any older fallback requests before issuing a batch request
     for (var slot in inFlightRequests) {
       if (Object.prototype.hasOwnProperty.call(inFlightRequests, slot)) {
         if (slot !== 'stops' && slot !== 'batch') {
@@ -833,45 +1277,39 @@
       'batch',
       url,
       function(data) {
-        if (!data || !data.stations) return;
+        if (!data || !data.stations) {
+          markPollFailure();
+          return;
+        }
+        var now = (new Date()).getTime();
         for (var j = 0; j < STATIONS.length; j++) {
           var st = STATIONS[j];
           var refs = stationRefs[j] || cacheStationRefs(document.getElementById('station' + j));
           if (refs && refs.root && data.stations[st]) {
+            saveStationSnapshot(st, data.stations[st], now);
             renderStationData(st, refs, data.stations[st], j === 0);
           }
         }
         if (requestedExtra && data.extra_alert) {
           renderExtraAlert(requestedExtra, data.extra_alert);
         }
-        maybePeriodicReload();
+        markPollSuccess(now);
+        maybePeriodicReload(now);
       },
       function(status) {
         if (status === 404) {
           batchSupported = false;
           startStaggeredFallback();
+        } else {
+          markPollFailure();
         }
       }
     );
   }
 
   function bindUiEvents() {
-    var stationsEl = document.getElementById('stations');
-    if (stationsEl) {
-      stationsEl.addEventListener('click', function(evt) {
-        var target = evt.target;
-        while (target && target !== stationsEl) {
-          if (target.classList && target.classList.contains('stationTitle')) {
-            showPicker();
-            return;
-          }
-          target = target.parentNode;
-        }
-      });
-    }
-
-    var addBtn = document.getElementById('addStationBtn');
-    if (addBtn) addBtn.addEventListener('click', addStation);
+    var editBtn = document.getElementById('editStationsBtn');
+    if (editBtn) editBtn.addEventListener('click', showPicker);
 
     var saveBtn = document.getElementById('savePickerBtn');
     if (saveBtn) saveBtn.addEventListener('click', savePicker);
@@ -911,7 +1349,10 @@
       showPicker: showPicker,
       hidePicker: hidePicker,
       drawPickerList: drawPickerList,
-      addStation: addStation,
+      drawPickerStep: drawPickerStep,
+      selectLine: selectLine,
+      selectBorough: selectBorough,
+      addStationById: addStationById,
       moveStation: moveStation,
       deleteStation: deleteStation,
       savePicker: savePicker,
@@ -923,7 +1364,13 @@
       refreshAll: refreshAll,
       abortAllRequests: abortAllRequests,
       maybePeriodicReload: maybePeriodicReload,
+      formatOfflineAge: formatOfflineAge,
+      tickCachedCountdowns: tickCachedCountdowns,
+      updateOfflineUi: updateOfflineUi,
+      markPollSuccess: markPollSuccess,
+      markPollFailure: markPollFailure,
       colorTrain: colorTrain,
+      naturalCmp: naturalCmp,
       isValidStation: isValidStation,
       isValidTrain: isValidTrain,
       getState: function() {
@@ -933,8 +1380,15 @@
           allStations: ALL_STATIONS,
           currentPickerStations: currentPickerStations,
           stopsLoaded: stopsLoaded,
+          pickerStep: pickerStep,
+          selectedLine: selectedLine,
+          selectedBoro: selectedBoro,
           batchSupported: batchSupported,
           pickerOpen: pickerOpen,
+          lastSuccessAt: lastSuccessAt,
+          consecutiveFailures: consecutiveFailures,
+          lastStationSnapshots: lastStationSnapshots,
+          cachedTrainsExhausted: cachedTrainsExhausted,
           inFlightSlots: inFlightRequests
         };
       },
@@ -943,16 +1397,20 @@
         if (s.extraTrain !== undefined) EXTRA_TRAIN = s.extraTrain;
         if (s.allStations !== undefined) {
           ALL_STATIONS = s.allStations;
-          ALL_STATIONS_MAP = {};
-          for (var i = 0; i < ALL_STATIONS.length; i++) {
-            ALL_STATIONS_MAP[ALL_STATIONS[i].id] = ALL_STATIONS[i].name;
-          }
+          indexStops(ALL_STATIONS);
         }
         if (s.currentPickerStations !== undefined) currentPickerStations = s.currentPickerStations;
         if (s.stopsLoaded !== undefined) stopsLoaded = s.stopsLoaded;
+        if (s.pickerStep !== undefined) pickerStep = s.pickerStep;
+        if (s.selectedLine !== undefined) selectedLine = s.selectedLine;
+        if (s.selectedBoro !== undefined) selectedBoro = s.selectedBoro;
         if (s.batchSupported !== undefined) batchSupported = s.batchSupported;
         if (s.pickerOpen !== undefined) pickerOpen = s.pickerOpen;
         if (s.pageLoadedAt !== undefined) pageLoadedAt = s.pageLoadedAt;
+        if (s.lastSuccessAt !== undefined) lastSuccessAt = s.lastSuccessAt;
+        if (s.consecutiveFailures !== undefined) consecutiveFailures = s.consecutiveFailures;
+        if (s.lastStationSnapshots !== undefined) lastStationSnapshots = s.lastStationSnapshots;
+        if (s.cachedTrainsExhausted !== undefined) cachedTrainsExhausted = s.cachedTrainsExhausted;
       }
     };
   }

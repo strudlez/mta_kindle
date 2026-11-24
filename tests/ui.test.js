@@ -9,6 +9,7 @@ const BIN_PATH = path.join(ROOT, 'target/debug/mta');
 
 const STATION_NAMES = {
   L08: 'Bedford Av',
+  L10: 'Lorimer St',
   A32: 'W 4 St-Wash Sq',
   '901': 'Grand Central-42 St',
   '101': 'Van Cortlandt Park-242 St',
@@ -127,8 +128,37 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
             ]);
           }
 
-          const isXss = mockMode === 'xss';
           const shortName = station.charAt(0);
+          if (mockMode === 'offline_schedule') {
+            const nowSec = Math.floor(Date.now() / 1000);
+            return Response.json([
+              {
+                stop: { name: baseName },
+                alerts: [],
+                groups: [
+                  {
+                    headsign: 'Manhattan',
+                    route: { shortName },
+                    times: [
+                      { serviceDay: 0, realtimeArrival: nowSec + 150 },
+                      { serviceDay: 0, realtimeArrival: nowSec + 330 },
+                      { serviceDay: 0, realtimeArrival: nowSec + 630 },
+                      { serviceDay: 0, realtimeArrival: nowSec + 930 },
+                    ],
+                  },
+                  {
+                    headsign: 'Brooklyn',
+                    route: { shortName },
+                    times: [
+                      { serviceDay: 0, realtimeArrival: nowSec + 450 },
+                    ],
+                  },
+                ],
+              },
+            ]);
+          }
+
+          const isXss = mockMode === 'xss';
           return Response.json([
             {
               stop: { name: isXss ? xss : baseName },
@@ -218,7 +248,7 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
     });
 
     await waitForServer(baseUrl);
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, args: ['--disable-gpu'] });
   }, 60000);
 
   afterAll(async () => {
@@ -261,19 +291,25 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
       expect(await station0.locator('.inboundTitle').textContent()).toBe('Manhattan');
       expect(await station0.locator('.outboundTitle').textContent()).toBe('Brooklyn');
 
-      // Express LX badge renders as "L" with .express class and rotated transform
+      const editBtn = page.locator('#editStationsBtn');
+      await editBtn.waitFor({ state: 'visible' });
+      const iconStatus = await editBtn.locator('.edit-icon').evaluate((img) => ({
+        complete: img.complete,
+        naturalWidth: img.naturalWidth,
+        naturalHeight: img.naturalHeight,
+      }));
+      expect(iconStatus).toEqual({ complete: true, naturalWidth: 44, naturalHeight: 44 });
+
       const inboundColor = station0.locator('.inbound1 .trainColor');
       expect(await inboundColor.locator('.trainName').textContent()).toBe('L');
       expect(await inboundColor.evaluate((el) => el.classList.contains('express'))).toBe(true);
       const transform = await inboundColor.evaluate((el) => getComputedStyle(el).transform);
       expect(transform).not.toBe('none');
 
-      // Local badge has circular border-radius
       const outboundColor = station0.locator('.outbound1 .trainColor');
       expect(await outboundColor.evaluate((el) => el.classList.contains('local'))).toBe(true);
       expect(await outboundColor.evaluate((el) => getComputedStyle(el).borderRadius)).toBe('50%');
 
-      // Alerts render when status != Good Service
       await page.locator('.alerts').waitFor({ state: 'visible' });
       expect(await page.locator('.alerts .alertsTitle').textContent()).toBe('L: Delays');
       expect(await page.locator('.alerts .alertsBody').textContent()).toContain('L train delays');
@@ -288,17 +324,14 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
       expect(alertsStyle.whiteSpace).toBe('pre-line');
       expect(alertsStyle.height).toBeGreaterThan(30);
 
-      // /static/ alias works for prefix-stripping reverse proxies
       const staticResp = await page.request.get(`${baseUrl}/static/css/styles.css`);
       expect(staticResp.status()).toBe(200);
 
-      // No horizontal overflow on Kindle viewport
       const overflow = await page.evaluate(
         () => document.documentElement.scrollWidth <= window.innerWidth + 1,
       );
       expect(overflow).toBe(true);
 
-      // Good Service hides extra alert banner
       await page.goto(`${baseUrl}/#L08&G`, { waitUntil: 'networkidle' });
       expect(await page.locator('.alerts2').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
     } finally {
@@ -306,44 +339,82 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
     }
   }, 15000);
 
-  test('station picker supports tap, add, reorder, delete, cancel, validation alert, and multi-station save', async () => {
+  test('3-tap picker supports line, borough, 3-col natural grid, reorder, cancel, delete, and batch save', async () => {
     mockMode = 'ok';
     goodServiceRoutes = [];
     const { context, page, pageErrors, consoleErrors, requestedUrls } = await openKindlePage('/');
     try {
       await page.locator('#station0 .stationTitle').waitFor({ state: 'visible' });
 
-      // Tap station title to open picker -> lazy loads stops.txt once
-      await realTap(page, page.locator('#station0 .stationTitle'));
+      // Tap top-right pencil button -> opens Step 1 (Line bullets) & lazy-loads stops.txt once
+      await realTap(page, page.locator('#editStationsBtn'));
       await page.locator('#picker').waitFor({ state: 'visible' });
-      await page.waitForFunction(() => document.querySelectorAll('#pickerSelect option').length > 400);
-
+      await page.locator('.line-btn').first().waitFor({ state: 'visible' });
       expect(requestedUrls.filter((u) => u.includes('stops.txt')).length).toBe(1);
-      expect(await page.locator('#pickerSelect option').count()).toBe(476); // default + 475 stops
 
-      // Add A32
-      await page.selectOption('#pickerSelect', 'A32');
-      await realTap(page, page.locator('#addStationBtn'));
+      // Step 1 -> tap line '1' -> Step 2 (Boroughs) -> tap Manhattan -> 35 stops fit <= 900px without scroll
+      await realTap(page, page.locator('.line-btn', { hasText: /^1$/ }));
+      await page.locator('.boro-card').first().waitFor({ state: 'visible' });
+      await realTap(page, page.locator('.boro-card', { hasText: 'Manhattan' }));
+      await page.locator('.station-opt').first().waitFor({ state: 'visible' });
+
+      expect(await page.locator('#pickerManage').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
+      const gridMetrics = await page.evaluate(() => {
+        const tiles = Array.from(document.querySelectorAll('.station-opt')).map((el) => el.textContent);
+        return {
+          count: tiles.length,
+          first3: tiles.slice(0, 3),
+          hasTimesSq: tiles.some((t) => t.startsWith('Times Sq-42 St')),
+          last: tiles[tiles.length - 1],
+          pickerH: document.getElementById('picker').getBoundingClientRect().height,
+          scrollH: document.documentElement.scrollHeight,
+          innerH: window.innerHeight,
+          scrollW: document.documentElement.scrollWidth,
+          innerW: window.innerWidth,
+        };
+      });
+      expect(gridMetrics.count).toBe(35);
+      expect(gridMetrics.first3).toEqual(['14 St (1/2/3)', '18 St', '23 St']);
+      expect(gridMetrics.hasTimesSq).toBe(true);
+      expect(gridMetrics.last).toBe('WTC Cortlandt');
+      expect(gridMetrics.pickerH).toBeLessThanOrEqual(900);
+      expect(gridMetrics.scrollH).toBeLessThanOrEqual(gridMetrics.innerH);
+      expect(gridMetrics.scrollW).toBeLessThanOrEqual(gridMetrics.innerW + 1);
+
+      // Navigate back: <- Boroughs -> <- Lines -> tap A -> Manhattan -> W 4 St-Wash Sq
+      await realTap(page, page.locator('#pickerStepHeader .btn-secondary'));
+      await page.locator('.boro-card').first().waitFor({ state: 'visible' });
+      await realTap(page, page.locator('#pickerStepHeader .btn-secondary'));
+      await page.locator('.line-btn').first().waitFor({ state: 'visible' });
+
+      await realTap(page, page.locator('.line-btn', { hasText: /^A$/ }));
+      await realTap(page, page.locator('.boro-card', { hasText: 'Manhattan' }));
+      await realTap(page, page.locator('.station-opt', { hasText: 'W 4 St-Wash Sq' }));
+
+      // Returned to Step 1 with W 4 St-Wash Sq added and single-row actions
+      expect(await page.locator('#pickerManage').evaluate((el) => el.classList.contains('hidden'))).toBe(false);
       expect(await page.locator('.picker-item').count()).toBe(2);
-      expect(await page.locator('.picker-item-name').nth(0).textContent()).toContain('Bedford Av');
-      expect(await page.locator('.picker-item-name').nth(1).textContent()).toContain('W 4 St-Wash Sq');
+      expect(await page.locator('.picker-item-name').nth(0).textContent()).toBe('Bedford Av');
+      expect(await page.locator('.picker-item-name').nth(1).textContent()).toBe('W 4 St-Wash Sq');
 
-      // Move up second item -> swaps order; move down first -> restores order
-      await realTap(page, page.locator('.picker-item').nth(1).locator('.picker-item-btn').nth(0));
-      expect(await page.locator('.picker-item-name').nth(0).textContent()).toContain('W 4 St-Wash Sq');
-      await realTap(page, page.locator('.picker-item').nth(0).locator('.picker-item-btn').nth(1));
-      expect(await page.locator('.picker-item-name').nth(0).textContent()).toContain('Bedford Av');
+      // Reorder up then down
+      await realTap(page, page.locator('.picker-item').nth(1).locator('.icon-btn').nth(0));
+      expect(await page.locator('.picker-item-name').nth(0).textContent()).toBe('W 4 St-Wash Sq');
+      await realTap(page, page.locator('.picker-item').nth(0).locator('.icon-btn').nth(1));
+      expect(await page.locator('.picker-item-name').nth(0).textContent()).toBe('Bedford Av');
 
-      // Cancel discards unsaved edits and returns to main; reopening picker does NOT re-fetch stops.txt
+      // Cancel discards unsaved edits; tapping station title does NOT open picker; reopening via pencil does NOT re-fetch stops.txt
       await realTap(page, page.locator('#hidePickerBtn'));
       await page.locator('#main').waitFor({ state: 'visible' });
       await realTap(page, page.locator('#station0 .stationTitle'));
+      expect(await page.locator('#picker').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
+      await realTap(page, page.locator('#editStationsBtn'));
       await page.locator('#picker').waitFor({ state: 'visible' });
       expect(requestedUrls.filter((u) => u.includes('stops.txt')).length).toBe(1);
       expect(await page.locator('.picker-item').count()).toBe(1);
 
-      // Delete remaining station and tap Save -> triggers alert dialog without navigating
-      await realTap(page, page.locator('.picker-item').nth(0).locator('.picker-item-btn').nth(2));
+      // Delete remaining station and tap Save -> triggers alert dialog
+      await realTap(page, page.locator('.picker-item').nth(0).locator('.icon-btn').nth(2));
       expect(await page.locator('.picker-item').count()).toBe(0);
 
       const dialogs = [];
@@ -354,11 +425,14 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
       await realTap(page, page.locator('#savePickerBtn'));
       expect(dialogs).toEqual(['Please select at least one station.']);
 
-      // Add L08 and A32, then Save -> navigates to ?q=L08,A32&4
-      await page.selectOption('#pickerSelect', 'L08');
-      await realTap(page, page.locator('#addStationBtn'));
-      await page.selectOption('#pickerSelect', 'A32');
-      await realTap(page, page.locator('#addStationBtn'));
+      // Add Bedford Av (L -> Bk) and W 4 St-Wash Sq (A -> M) and Save
+      await realTap(page, page.locator('.line-btn', { hasText: /^L$/ }));
+      await realTap(page, page.locator('.boro-card', { hasText: 'Brooklyn' }));
+      await realTap(page, page.locator('.station-opt', { hasText: 'Bedford Av' }));
+
+      await realTap(page, page.locator('.line-btn', { hasText: /^A$/ }));
+      await realTap(page, page.locator('.boro-card', { hasText: 'Manhattan' }));
+      await realTap(page, page.locator('.station-opt', { hasText: 'W 4 St-Wash Sq' }));
 
       goodServiceRoutes = [];
       await Promise.all([
@@ -373,13 +447,11 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
       expect(await page.locator('#station1 .stationTitle').textContent()).toBe('W 4 St-Wash Sq');
       expect(await page.locator('#stations').evaluate((el) => el.classList.contains('small'))).toBe(true);
 
-      // Multi-station mode applies CSS class colors (CSP-compliant, no inline styles)
       const aBg = await page.locator('#station1 .inbound1 .trainColor').evaluate(
         (el) => getComputedStyle(el).backgroundColor,
       );
-      expect(aBg).toBe('rgb(0, 57, 166)'); // #0039A6 for A train
+      expect(aBg).toBe('rgb(0, 57, 166)');
 
-      // Multi-station mode used a single /mta/batch request and skipped goodservice.io for 'A'
       expect(requestedUrls.some((u) => u === '/mta/batch?stations=L08,A32&extra=4')).toBe(true);
       expect(goodServiceRoutes.includes('A')).toBe(false);
 
@@ -388,7 +460,7 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
     } finally {
       await context.close();
     }
-  }, 15000);
+  }, 20000);
 
   test('defends against DOM and upstream XSS, handles live hashchange, closed stations, and 500s', async () => {
     const { context, page, pageErrors } = await openKindlePage(
@@ -399,17 +471,16 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
       expect(await page.evaluate(() => window.__xss)).toBeUndefined();
       expect(await page.locator('#station0 .stationTitle').textContent()).toBe('Bedford Av');
 
-      // Malicious upstream HTML payloads render as inert text, never HTML elements
       mockMode = 'xss';
       await page.goto(`${baseUrl}/#901&4`, { waitUntil: 'networkidle' });
       await page.locator('#station0').waitFor({ state: 'visible' });
       expect(await page.evaluate(() => window.__xss)).toBeUndefined();
-      expect(await page.locator('img').count()).toBe(0);
+      expect(await page.locator('#stations img, .alerts img, .alerts2 img').count()).toBe(0);
+      expect(await page.locator('img[src="x"]').count()).toBe(0);
       expect(await page.locator('#station0 .stationTitle').textContent()).toBe(
         '<img src=x onerror="window.__xss=3">',
       );
 
-      // Live hash change updates stations and alert2 cleanly
       mockMode = 'ok';
       await page.goto(`${baseUrl}/#L08&4`, { waitUntil: 'networkidle' });
       await page.locator('#station0').waitFor({ state: 'visible' });
@@ -423,7 +494,6 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
         () => document.querySelector('.alerts2 .alertsTitle')?.textContent === 'F: Delays',
       );
 
-      // Closed station hides all train rows cleanly
       mockMode = 'closed';
       await page.goto(`${baseUrl}/#101&4`, { waitUntil: 'networkidle' });
       await page.locator('#station0').waitFor({ state: 'visible' });
@@ -431,7 +501,6 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
       expect(await page.locator('#station0 .inbound1').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
       expect(await page.locator('#station0 .outbound1').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
 
-      // Upstream 500 does not cause uncaught JS errors
       mockMode = '500';
       await page.goto(`${baseUrl}/#103&4`, { waitUntil: 'networkidle' });
       expect(pageErrors).toEqual([]);
@@ -466,4 +535,138 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
       await context.close();
     }
   }, 15000);
+
+  test('offline indicator handles initial 15s quick-retry, <5m local ticking, 5m+ dimmed past-train drop, exhaustion, and auto-recovery', async () => {
+    mockMode = 'offline_schedule';
+    let clientOffline = true;
+    const ctx1 = await browser.newContext({ viewport: { width: 758, height: 1024 } });
+    const page1 = await ctx1.newPage();
+    const errors1 = [];
+    page1.on('pageerror', (e) => errors1.push(e.message));
+    try {
+      await page1.clock.install();
+      await page1.route('**/mta/batch*', async (route) => {
+        if (clientOffline) {
+          await route.fulfill({ status: 502, body: 'offline' });
+        } else {
+          await route.continue();
+        }
+      });
+
+      await page1.goto(`${baseUrl}/#L10&G`, { waitUntil: 'domcontentloaded' });
+      await page1.locator('#offlineBanner').waitFor({ state: 'visible' });
+      await page1.locator('#offlineEmpty').waitFor({ state: 'visible' });
+
+      const initLayout = await page1.evaluate(() => {
+        const banner = document.getElementById('offlineBanner').getBoundingClientRect();
+        const edit = document.getElementById('editStationsBtn').getBoundingClientRect();
+        return {
+          bannerText: document.getElementById('offlineBanner').textContent.trim(),
+          bannerBottom: banner.bottom,
+          editTop: edit.top,
+          scrollW: document.documentElement.scrollWidth,
+          innerW: window.innerWidth,
+        };
+      });
+      expect(initLayout.bannerText).toBe('OFFLINE');
+      expect(initLayout.editTop).toBeGreaterThanOrEqual(initLayout.bannerBottom);
+      expect(initLayout.scrollW).toBeLessThanOrEqual(initLayout.innerW + 1);
+
+      // Part 1 recovery: restore connectivity and advance 15s -> automatic quick-retry recovers via real server
+      clientOffline = false;
+      await Promise.all([
+        page1.waitForResponse((r) => r.url().includes('/mta/batch') && r.status() === 200),
+        page1.clock.fastForward(15000),
+      ]);
+      await page1.locator('#station0').waitFor({ state: 'visible' });
+      expect(await page1.locator('#offlineBanner').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
+      expect(await page1.locator('#offlineEmpty').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
+      expect(await page1.locator('#station0 .inbound1 .countdown').textContent()).toBe('2');
+      expect(await page1.locator('#station0 .inbound2 .countdown').textContent()).toBe('5');
+      expect(await page1.locator('#station0 .inbound3 .countdown').textContent()).toBe('10');
+
+      // Part 2a: +1m brief outage (<5m) -> ticks down locally, keeps banner hidden
+      clientOffline = true;
+      await Promise.all([
+        page1.waitForResponse((r) => r.url().includes('/mta/batch') && r.status() === 502),
+        page1.clock.fastForward(60000),
+      ]);
+      await page1.waitForFunction(() => document.querySelector('#station0 .inbound1 .countdown')?.textContent === '1');
+      expect(await page1.locator('#offlineBanner').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
+      expect(await page1.locator('#stations').evaluate((el) => el.classList.contains('stale'))).toBe(false);
+      expect(await page1.locator('#station0 .inbound2 .countdown').textContent()).toBe('4');
+      expect(await page1.locator('#station0 .inbound3 .countdown').textContent()).toBe('9');
+
+      // Part 2b: +3m total offline -> 150s train passes into past and drops; 4th train (15m -> 12m) promotes
+      await Promise.all([
+        page1.waitForResponse((r) => r.url().includes('/mta/batch') && r.status() === 502),
+        page1.clock.fastForward(120000),
+      ]);
+      await page1.waitForFunction(() => document.querySelector('#station0 .inbound1 .countdown')?.textContent === '2');
+      expect(await page1.locator('#offlineBanner').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
+      expect(await page1.locator('#station0 .inbound2 .countdown').textContent()).toBe('7');
+      expect(await page1.locator('#station0 .inbound3 .countdown').textContent()).toBe('12');
+
+      // Part 3: +6m total offline (>=5m) -> banner appears, stale dimmed colors, 330s train dropped
+      await Promise.all([
+        page1.waitForResponse((r) => r.url().includes('/mta/batch') && r.status() === 502),
+        page1.clock.fastForward(180000),
+      ]);
+      await page1.locator('#offlineBanner').waitFor({ state: 'visible' });
+      const staleState = await page1.evaluate(() => {
+        const banner = document.getElementById('offlineBanner');
+        const edit = document.getElementById('editStationsBtn').getBoundingClientRect();
+        const bBox = banner.getBoundingClientRect();
+        const cd = document.querySelector('#station0 .inbound1 .countdown');
+        const tc = document.querySelector('#station0 .inbound1 .trainColor');
+        return {
+          bannerText: banner.textContent.replace(/\s+/g, ' ').trim(),
+          staleClass: document.getElementById('stations').classList.contains('stale'),
+          cdColor: getComputedStyle(cd).color,
+          tcBg: getComputedStyle(tc).backgroundColor,
+          c1: cd.textContent,
+          c2: document.querySelector('#station0 .inbound2 .countdown').textContent,
+          row3Hidden: document.querySelector('#station0 .inbound3').classList.contains('hidden'),
+          editTop: edit.top,
+          bannerBottom: bBox.bottom,
+          scrollW: document.documentElement.scrollWidth,
+          innerW: window.innerWidth,
+        };
+      });
+      expect(staleState.bannerText).toBe('OFFLINE · 5m+ ago');
+      expect(staleState.staleClass).toBe(true);
+      expect(staleState.cdColor).toBe('rgb(153, 153, 153)');
+      expect(staleState.tcBg).toBe('rgb(187, 187, 187)');
+      expect(staleState.c1).toBe('4');
+      expect(staleState.c2).toBe('9');
+      expect(staleState.row3Hidden).toBe(true);
+      expect(staleState.editTop).toBeGreaterThanOrEqual(staleState.bannerBottom);
+      expect(staleState.scrollW).toBeLessThanOrEqual(staleState.innerW + 1);
+
+      // Part 4: +16m total offline -> all cached trains in the past -> stations hide, offlineEmpty shows
+      await Promise.all([
+        page1.waitForResponse((r) => r.url().includes('/mta/batch') && r.status() === 502),
+        page1.clock.fastForward(600000),
+      ]);
+      await page1.locator('#offlineEmpty').waitFor({ state: 'visible' });
+      expect(await page1.locator('#stations').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
+      expect(await page1.locator('#offlineAge').textContent()).toBe('· 15m+ ago');
+
+      // Part 5: connectivity returns -> next 60s poll auto-recovers cleanly
+      clientOffline = false;
+      await Promise.all([
+        page1.waitForResponse((r) => r.url().includes('/mta/batch') && r.status() === 200),
+        page1.clock.fastForward(60000),
+      ]);
+      await page1.locator('#station0').waitFor({ state: 'visible' });
+      expect(await page1.locator('#offlineBanner').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
+      expect(await page1.locator('#offlineEmpty').evaluate((el) => el.classList.contains('hidden'))).toBe(true);
+      expect(await page1.locator('#stations').evaluate((el) => el.classList.contains('stale'))).toBe(false);
+      expect(await page1.locator('#station0 .inbound1 .countdown').evaluate((el) => getComputedStyle(el).color)).toBe('rgb(0, 0, 0)');
+      expect(await page1.locator('#station0 .inbound1 .countdown').textContent()).toBe('2');
+      expect(errors1).toEqual([]);
+    } finally {
+      await ctx1.close();
+    }
+  }, 25000);
 });

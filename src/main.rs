@@ -1081,8 +1081,10 @@ mod tests {
             "/mta/static/js/js.js",
             "/mta/static/css/styles.css",
             "/mta/static/js/stops.txt",
+            "/mta/static/img/pencil.png",
             "/static/js/js.js",
             "/static/css/styles.css",
+            "/static/img/pencil.png",
         ] {
             let req = actix_web::test::TestRequest::get().uri(path).to_request();
             let resp = actix_web::test::call_service(&app, req).await;

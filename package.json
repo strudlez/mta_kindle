@@ -3,7 +3,8 @@
   "scripts": {
     "test": "bun test",
     "test:unit": "bun test tests/js.test.js",
-    "test:ui": "bun test tests/ui.test.js"
+    "test:ui": "bun test tests/ui.test.js",
+    "preview:kindle": "bun scripts/preview-kindle.mjs"
   },
   "devDependencies": {
     "playwright-core": "1.60.0"

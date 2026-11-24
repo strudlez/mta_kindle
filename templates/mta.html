@@ -2,10 +2,14 @@
   <head>
     <meta charset="utf-8">
     <title>Countdown</title>
-    <link rel="stylesheet" href="mta/static/css/styles.css?v=2">
+    <link rel="stylesheet" href="mta/static/css/styles.css?v=5">
   </head>
   <body>
     <div class="body" id="main">
+      <div id="offlineBanner" class="hidden" role="status">
+        <span class="offline-left">OFFLINE <span id="offlineAge" class="offline-age"></span></span>
+      </div>
+      <button id="editStationsBtn" type="button" aria-label="Edit stations" title="Edit stations"><img class="edit-icon" src="mta/static/img/pencil.png" width="22" height="22" alt="Edit"></button>
       <div id="stations">
         <div id="station0" class="hidden">
           <div class="stationTitle"></div>
@@ -49,6 +53,7 @@
           </div>
         </div>
       </div>
+      <div id="offlineEmpty" class="hidden">Unable to reach MTA server. Retrying automatically...</div>
       <div class="alerts hidden">
         <div class="alertsTitle">Alerts </div>
         <div class="alertsBody"></div>
@@ -60,19 +65,21 @@
     </div>
 
     <div class="body hidden" id="picker">
-      <div id="pickerTitle">Manage Stations</div>
-      <div id="pickerList"></div>
-      <div class="picker-controls">
-        <select id="pickerSelect">
-          <option value="">Select a station...</option>
-        </select>
-        <button id="addStationBtn" class="picker-btn" type="button">Add</button>
+      <div id="pickerManage">
+        <div class="mta-bar">
+          <span class="mta-title" id="pickerTitle">Stations</span>
+          <span class="mta-actions">
+            <button id="hidePickerBtn" class="btn-secondary" type="button">Cancel</button>
+            <button id="savePickerBtn" class="btn-primary" type="button">Save</button>
+          </span>
+        </div>
+        <div id="pickerList"></div>
       </div>
-      <div class="picker-controls">
-        <button id="savePickerBtn" class="picker-btn" type="button">Save</button>
-        <button id="hidePickerBtn" class="picker-btn" type="button">Cancel</button>
+      <div id="pickerBrowse">
+        <div id="pickerStepHeader"></div>
+        <div id="pickerStepBody"></div>
       </div>
     </div>
-    <script src="mta/static/js/js.js?v=2"></script>
+    <script src="mta/static/js/js.js?v=5"></script>
   </body>
 </html>
