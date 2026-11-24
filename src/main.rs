@@ -1,42 +1,157 @@
-use std::{sync::Arc, collections::HashMap, str};
-use actix_files::NamedFile;
-use actix_web::{Result};
-use actix_web::{get, web, App, HttpRequest, HttpResponse, HttpServer, middleware, web::Data};
-use askama::{Template};
-use awc::{http::header, Client, Connector};
-use rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore};
-use serde::{Serialize};
-use serde_json::{Value};
-use chrono::{Utc};
-use chrono_tz::{America::New_York};
-use cached::proc_macro::cached;
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate dotenv_codegen;
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
-const EMPTY_VEC : Vec<Value> = Vec::new();
-lazy_static! {
-    static ref API_KEY: String = dotenv!("API_KEY").to_string();
+use actix_web::{
+    get,
+    http::header,
+    middleware::{self, DefaultHeaders},
+    web::{self, Data},
+    App, Error, HttpResponse, HttpServer, Result,
+};
+use awc::{Client, Connector};
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+const INDEX_HTML: &str = include_str!("../templates/mta.html");
+const STOPS_TXT: &str = include_str!("../static/js/stops.txt");
+
+const VALID_TRAINS: &[&str] = &[
+    "1", "2", "3", "4", "5", "6", "6X", "7", "7X", "A", "B", "C", "D", "E", "F", "FX", "G", "GS",
+    "FS", "H", "J", "L", "M", "N", "Q", "R", "S", "SI", "W", "Z",
+];
+
+const CSP_HEADER: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
+
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
+const MAX_COUNTDOWN_CACHE_ENTRIES: usize = 500;
+const MAX_ALERTS_CACHE_ENTRIES: usize = 100;
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct CacheEntry<V> {
+    value: V,
+    inserted_at: Instant,
 }
 
-#[derive(Template)]
-#[template(path = "mta.html")]
-struct Mta;
-
-#[get("/")]
-async fn mta() -> Result<HttpResponse> {
-    let s = Mta.render().unwrap();
-    Ok(HttpResponse::Ok().content_type("text/html").body(s))
+/// Bounded in-memory TTL cache with per-key single-flight request coalescing.
+struct TtlCache<V> {
+    ttl: Duration,
+    max_entries: usize,
+    entries: Mutex<HashMap<String, CacheEntry<V>>>,
+    in_flight: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
-#[get("/mta/times")]
-async fn get_time(_query: web::Query<HashMap<String, String>>) -> Result<HttpResponse> {
-    let time = 0;
-    Ok(HttpResponse::Ok().content_type("text/text").body(time.to_string()))
+impl<V: Clone> TtlCache<V> {
+    fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            ttl,
+            max_entries: max_entries.max(1),
+            entries: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get_fresh(&self, key: &str) -> Option<V> {
+        let guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(key).and_then(|entry| {
+            if entry.inserted_at.elapsed() < self.ttl {
+                Some(entry.value.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn acquire_key_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut guard = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() > self.max_entries {
+            guard.retain(|_, weak| weak.strong_count() > 0);
+        }
+        if let Some(existing) = guard.get(key).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        guard.insert(key.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn insert(&self, key: String, value: V) {
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let ttl = self.ttl;
+        guard.retain(|_, entry| entry.inserted_at.elapsed() < ttl);
+        if !guard.contains_key(&key) && guard.len() >= self.max_entries {
+            if let Some(oldest_key) = guard
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(k, _)| k.clone())
+            {
+                guard.remove(&oldest_key);
+            }
+        }
+        guard.insert(
+            key,
+            CacheEntry {
+                value,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    async fn get_or_try_insert_with<E, F, Fut>(&self, key: &str, loader: F) -> Result<V, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<V, E>>,
+    {
+        if let Some(hit) = self.get_fresh(key) {
+            return Ok(hit);
+        }
+
+        let key_lock = self.acquire_key_lock(key);
+        let _flight_guard = key_lock.lock().await;
+
+        if let Some(hit) = self.get_fresh(key) {
+            return Ok(hit);
+        }
+
+        let value = loader().await?;
+        self.insert(key.to_string(), value.clone());
+        Ok(value)
+    }
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Clone)]
+struct AppState {
+    api_key: String,
+    mta_base_url: String,
+    goodservice_base_url: String,
+    valid_stops: HashSet<String>,
+    alerts_cache: Arc<TtlCache<Arc<TrainStatus>>>,
+    countdown_cache: Arc<TtlCache<Arc<CountdownCore>>>,
+}
+
+impl AppState {
+    fn new(
+        api_key: String,
+        mta_base_url: String,
+        goodservice_base_url: String,
+        valid_stops: HashSet<String>,
+        cache_ttl: Duration,
+    ) -> Self {
+        Self {
+            api_key,
+            mta_base_url,
+            goodservice_base_url,
+            valid_stops,
+            alerts_cache: Arc::new(TtlCache::new(cache_ttl, MAX_ALERTS_CACHE_ENTRIES)),
+            countdown_cache: Arc::new(TtlCache::new(cache_ttl, MAX_COUNTDOWN_CACHE_ENTRIES)),
+        }
+    }
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 struct Countdown {
     name: String,
     alerts: Vec<String>,
@@ -44,7 +159,14 @@ struct Countdown {
     route_times: HashMap<String, Vec<TrainTime>>,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Debug, Clone)]
+struct CountdownCore {
+    name: String,
+    alerts: Vec<String>,
+    route_times: HashMap<String, Vec<TrainTime>>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 struct TrainTime {
     seconds: i64,
     mins: i64,
@@ -53,239 +175,888 @@ struct TrainTime {
     train_name: String,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 struct TrainStatus {
     status: String,
-    alerts: Vec<String>
+    alerts: Vec<String>,
+}
+
+impl TrainStatus {
+    fn unknown() -> Self {
+        Self {
+            status: "?".to_string(),
+            alerts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct GoodServiceResponse {
+    status: Option<String>,
+    #[serde(default)]
+    service_change_summaries: ServiceChangeSummaries,
+    #[serde(default)]
+    service_irregularity_summaries: ServiceIrregularitySummaries,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct ServiceChangeSummaries {
+    #[serde(default)]
+    both: Vec<String>,
+    #[serde(default)]
+    north: Vec<String>,
+    #[serde(default)]
+    south: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct ServiceIrregularitySummaries {
+    north: Option<String>,
+    south: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct MtaNearbyItem {
+    #[serde(default)]
+    stop: MtaStop,
+    #[serde(default)]
+    alerts: Vec<MtaAlert>,
+    #[serde(default)]
+    groups: Vec<MtaGroup>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct MtaStop {
+    name: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct MtaAlert {
+    effective_start_date: Option<i64>,
+    effective_end_date: Option<i64>,
+    alert_header_text: Option<String>,
+    human_readable_active_period: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct MtaGroup {
+    headsign: Option<String>,
+    #[serde(default)]
+    route: MtaRoute,
+    #[serde(default)]
+    times: Vec<MtaTime>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct MtaRoute {
+    short_name: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct MtaTime {
+    service_day: Option<i64>,
+    realtime_arrival: Option<i64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct CountdownQuery {
+    alerts: Option<u8>,
+}
+
+fn parse_valid_stops(csv: &str) -> HashSet<String> {
+    csv.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let id = trimmed.split(',').next()?.trim();
+            if !id.is_empty() && id.len() <= 5 && id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_valid_train(train: &str) -> bool {
+    VALID_TRAINS.contains(&train)
+}
+
+fn is_valid_station(station: &str, valid_stops: &HashSet<String>) -> bool {
+    !station.is_empty()
+        && station.len() <= 5
+        && station
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        && valid_stops.contains(station)
+}
+
+fn station_alert_line(station: &str) -> Option<&'static str> {
+    let ch = station.chars().next()?;
+    if ch == '9' {
+        return Some("GS");
+    }
+    let mut buf = [0u8; 4];
+    let s = ch.encode_utf8(&mut buf);
+    VALID_TRAINS.iter().copied().find(|&t| t == s)
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn to_countdown(time: i64, now_sec: i64, estimated: bool, name: &str) -> TrainTime {
     let mut diff = time - now_sec;
-    // Is rounded or floor preferable
     // When the day changes we go from 23h to 0h
     if diff < -14400 {
-        diff = diff + 86400
+        diff += 86400;
     }
-    let diffmin = diff/60;
+    let diffmin = diff / 60;
 
     let mut hour = (time / 3600) % 12;
     if hour == 0 {
-        hour = 12
+        hour = 12;
     }
-    let min = (time / 60) % 60;
-    return TrainTime {
+    let min = (time / 60).rem_euclid(60);
+    TrainTime {
         seconds: diff,
         mins: diffmin,
         time: format!("{}:{:02}", hour, min),
-        estimated: estimated,
+        estimated,
         train_name: name.to_string(),
-    };
+    }
 }
 
-#[get("/mta/alerts/{train:.*}")]
-async fn train_alerts(req: HttpRequest, client: Data<Client>) -> Result<HttpResponse> {
-    let train = req.match_info().query("train");
-    let train_status = get_alerts(client, train.to_string());
-    let train_result = train_status.await.unwrap();
-    Ok(HttpResponse::Ok().content_type("text/json").body(serde_json::to_string(&train_result)?))
+fn build_alerts_url(base_url: &str, train: &str) -> Result<String, Error> {
+    let base = Url::parse(base_url).map_err(|_| actix_web::error::ErrorInternalServerError("invalid base url"))?;
+    base.join(&format!("/api/routes/{}", train))
+        .map(|u| u.to_string())
+        .map_err(|_| actix_web::error::ErrorBadRequest("invalid train"))
 }
 
-// Cache requests to not hammer servers
-#[cached(
-    time = 30,
-    convert = r##"{ format!("{}", train) }"##,
-    option = true,
-    key = "String"
-)]
-async fn get_alerts(client: Data<Client>, train: String) -> Option<TrainStatus> {
-    let train_owned = train.to_owned();
-    let req_path = [
-        "https://www.goodservice.io/api/routes/",
-        &train_owned].join("");
-    let mut res = client.get(req_path).send().await.unwrap();
+fn build_mta_url(base_url: &str, station: &str, api_key: &str) -> Result<String, Error> {
+    let base = Url::parse(base_url).map_err(|_| actix_web::error::ErrorInternalServerError("invalid base url"))?;
+    let mut url = base
+        .join("/otp/routers/default/nearby")
+        .map_err(|_| actix_web::error::ErrorBadRequest("invalid station"))?;
+    url.query_pairs_mut()
+        .append_pair("stops", &format!("MTASBWY:{}", station))
+        .append_pair("apikey", api_key);
+    Ok(url.to_string())
+}
 
-    let payload = res
-        .json::<Value>()
+async fn fetch_alerts(client: &Client, state: &AppState, train: &str) -> Result<Arc<TrainStatus>, Error> {
+    let train_key = train.to_string();
+    state
+        .alerts_cache
+        .get_or_try_insert_with(&train_key, || async {
+            let req_url = build_alerts_url(&state.goodservice_base_url, &train_key)?;
+            let mut res = client
+                .get(&req_url)
+                .send()
+                .await
+                .map_err(|err| {
+                    log::warn!("goodservice request failed for {}: {}", train_key, err);
+                    actix_web::error::ErrorBadGateway("upstream error")
+                })?;
+
+            if !res.status().is_success() {
+                log::warn!("goodservice returned status {} for {}", res.status(), train_key);
+                return Err(actix_web::error::ErrorBadGateway("upstream error"));
+            }
+
+            let parsed = res.json::<GoodServiceResponse>().await.map_err(|err| {
+                log::warn!("goodservice invalid json for {}: {}", train_key, err);
+                actix_web::error::ErrorBadGateway("invalid upstream response")
+            })?;
+
+            let status = parsed.status.unwrap_or_else(|| "?".to_string());
+            let mut alerts = Vec::new();
+            alerts.extend(parsed.service_change_summaries.both);
+            alerts.extend(parsed.service_change_summaries.north);
+            alerts.extend(parsed.service_change_summaries.south);
+            if let Some(north) = parsed.service_irregularity_summaries.north {
+                alerts.push(north);
+            }
+            if let Some(south) = parsed.service_irregularity_summaries.south {
+                alerts.push(south);
+            }
+
+            Ok(Arc::new(TrainStatus { status, alerts }))
+        })
         .await
-        .unwrap();
-    let json = payload.as_object().unwrap();
-
-    let status = json.get("status").and_then(Value::as_str)
-        .unwrap_or("?");
-    let mut alerts: Vec<String> = Vec::new();
-    let serv = json.get("service_change_summaries").and_then(Value::as_object);
-    for change in serv.and_then(|j| {j.get("both")}).and_then(Value::as_array).unwrap_or(&EMPTY_VEC).iter() {
-            let changes = change.as_str();
-            if changes.is_some() {
-                alerts.push(changes.unwrap().to_string());
-            }
-        }
-    for change in serv.and_then(|j| {j.get("north")}).and_then(Value::as_array).unwrap_or(&EMPTY_VEC).iter() {
-            let changes = change.as_str();
-            if changes.is_some() {
-                alerts.push(changes.unwrap().to_string());
-            }
-        }
-    for change in serv.and_then(|j| {j.get("south")}).and_then(Value::as_array).unwrap_or(&EMPTY_VEC).iter() {
-            let changes = change.as_str();
-            if changes.is_some() {
-                alerts.push(changes.unwrap().to_string());
-            }
-        }
-    let irr = json.get("service_irregularity_summaries").and_then(Value::as_object);
-    let irr_n = irr.and_then(|i| {i.get("north")}).and_then(Value::as_str);
-    let irr_s = irr.and_then(|i| {i.get("south")}).and_then(Value::as_str);
-    if irr_n.is_some() {
-        alerts.push(irr_n.unwrap().to_string());
-    }
-    if irr_s.is_some() {
-        alerts.push(irr_s.unwrap().to_string());
-    }
-
-    Some(TrainStatus {
-        status: status.to_string(),
-        alerts: alerts
-    })
 }
 
-#[get("/mta/countdown/{station:.*}")]
-async fn countdown(req: HttpRequest, client: Data<Client>) -> Result<HttpResponse> {
-    let station = req.match_info().query("station");
-    let result = get_countdown(client, station.to_string()).await.unwrap();
-    Ok(HttpResponse::Ok().content_type("text/json").body(serde_json::to_string(&result)?))
+async fn fetch_countdown_core(
+    client: &Client,
+    state: &AppState,
+    station: &str,
+) -> Result<Arc<CountdownCore>, Error> {
+    let station_key = station.to_string();
+    state
+        .countdown_cache
+        .get_or_try_insert_with(&station_key, || async {
+            let now_sec = unix_now_secs();
+            let req_url = build_mta_url(&state.mta_base_url, &station_key, &state.api_key)?;
+            let mut res = client
+                .get(&req_url)
+                .send()
+                .await
+                .map_err(|err| {
+                    // Never log req_url because it contains the API key query parameter
+                    log::warn!("mta request failed for station {}: {}", station_key, err);
+                    actix_web::error::ErrorBadGateway("upstream error")
+                })?;
 
+            if !res.status().is_success() {
+                log::warn!("mta returned status {} for station {}", res.status(), station_key);
+                return Err(actix_web::error::ErrorBadGateway("upstream error"));
+            }
+
+            let items = res.json::<Vec<MtaNearbyItem>>().await.map_err(|err| {
+                log::warn!("mta invalid json for station {}: {}", station_key, err);
+                actix_web::error::ErrorBadGateway("invalid upstream response")
+            })?;
+
+            let item = items
+                .into_iter()
+                .next()
+                .ok_or_else(|| actix_web::error::ErrorNotFound("station not found"))?;
+
+            let mut alerts = Vec::new();
+            for alert in item.alerts {
+                let alert_start = alert.effective_start_date.unwrap_or(0) / 1000;
+                let alert_end = alert.effective_end_date.unwrap_or(0) / 1000;
+                if alert_start == 0
+                    || alert_end == 0
+                    || alert_start > now_sec + 3600
+                    || alert_end < now_sec
+                {
+                    continue;
+                }
+                let header_text = alert.alert_header_text.unwrap_or_default();
+                let active_period = alert.human_readable_active_period.unwrap_or_default();
+                alerts.push(format!("{} : {}", header_text, active_period));
+            }
+
+            let mut route_times: HashMap<String, Vec<TrainTime>> = HashMap::new();
+            for group in item.groups {
+                let route = group.headsign.unwrap_or_else(|| "???".to_string());
+                let train_name = group.route.short_name.unwrap_or_else(|| "?".to_string());
+                let mut routes = Vec::with_capacity(group.times.len());
+
+                for train in group.times {
+                    if let (Some(today_sec), Some(realtime_arrival)) =
+                        (train.service_day, train.realtime_arrival)
+                    {
+                        routes.push(to_countdown(
+                            realtime_arrival,
+                            now_sec - today_sec,
+                            false,
+                            &train_name,
+                        ));
+                    }
+                }
+
+                if let Some(existing) = route_times.get_mut(&route) {
+                    existing.extend(routes);
+                } else {
+                    route_times.insert(route, routes);
+                }
+            }
+
+            for routes in route_times.values_mut() {
+                routes.sort_by_key(|r| r.seconds);
+            }
+
+            let stop_name = item.stop.name.unwrap_or_else(|| "error".to_string());
+
+            Ok(Arc::new(CountdownCore {
+                name: stop_name,
+                alerts,
+                route_times,
+            }))
+        })
+        .await
 }
 
-// Cache requests to not hammer servers
-#[cached(
-    time = 30,
-    convert = r##"{ format!("{}", station) }"##,
-    option = true,
-    key = "String"
-)]
-async fn get_countdown(client: Data<Client>, station: String) -> Option<Countdown> {
-    let station_owned = station.to_owned();
-    let now = Utc::now().with_timezone(&New_York);
-    let now_sec = now.timestamp();
+#[get("/")]
+async fn mta() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .insert_header((header::CACHE_CONTROL, "no-cache"))
+        .body(INDEX_HTML)
+}
 
-    let req_path = [
-        "https://otp-mta-prod.camsys-apps.com/otp/routers/default/nearby?stops=MTASBWY:",
-        &station_owned,
-        "&apikey=",
-        &API_KEY].join("");
-    let mut res = client.get(req_path).send().await.unwrap();
+#[get("/mta/alerts/{train}")]
+async fn train_alerts(
+    path: web::Path<String>,
+    client: Data<Client>,
+    state: Data<AppState>,
+) -> Result<HttpResponse> {
+    let train = path.into_inner();
+    if !is_valid_train(&train) {
+        return Err(actix_web::error::ErrorBadRequest("invalid train line"));
+    }
 
-    let payload = res
-        .json::<Vec<Value>>()
-        .await;
-    let train_status = get_alerts(client, station_owned[..1].to_string());
+    let status = fetch_alerts(&client, &state, &train).await?;
+    Ok(HttpResponse::Ok()
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .json(status.as_ref()))
+}
 
-    let mut alerts : Vec<String> = Vec::new();
-    let mut route_times : HashMap<String, Vec<TrainTime>> = HashMap::new();
-    let json = payload.unwrap();
-    let item = json.get(0).and_then(Value::as_object).unwrap();
-    for alert in item.get("alerts").and_then(Value::as_array).unwrap_or(&EMPTY_VEC).iter() {
-        let alert_start = alert.get("effectiveStartDate")
-            .and_then(Value::as_i64).unwrap_or(0) / 1000;
-        let alert_end = alert.get("effectiveEndDate")
-            .and_then(Value::as_i64).unwrap_or(0) / 1000;
-        if alert_start == 0 || alert_end == 0 ||
-            alert_start > now_sec + 3600 || alert_end < now_sec {
-            continue;
-        }
-        let alert_text = [
-            alert.get("alertHeaderText").and_then(Value::as_str).unwrap_or(""),
-            alert.get("humanReadableActivePeriod").and_then(Value::as_str).unwrap_or(""),
-        ].join(" : ");
-        alerts.push(alert_text);
+#[get("/mta/countdown/{station}")]
+async fn countdown(
+    path: web::Path<String>,
+    query: web::Query<CountdownQuery>,
+    client: Data<Client>,
+    state: Data<AppState>,
+) -> Result<HttpResponse> {
+    let station = path.into_inner();
+    if !is_valid_station(&station, &state.valid_stops) {
+        return Err(actix_web::error::ErrorBadRequest("invalid station"));
+    }
+
+    let include_alerts = query.alerts != Some(0);
+    let alert_line = if include_alerts {
+        station_alert_line(&station)
+    } else {
+        None
     };
-    for group in item.get("groups").and_then(Value::as_array).unwrap_or(&EMPTY_VEC) {
-        let route = group.get("headsign").and_then(Value::as_str).unwrap_or("???");
-        let train_name = group.get("route").and_then(Value::as_object)
-            .and_then(|r| { r.get("shortName") }).and_then(Value::as_str).unwrap_or("?");
-        let mut routes : Vec<TrainTime> = Vec::new();
 
-        for train in group.get("times").and_then(Value::as_array).unwrap_or(&EMPTY_VEC) {
-            let today_sec = train.get("serviceDay").and_then(Value::as_i64).unwrap();
-            let time = train.get("realtimeArrival").and_then(Value::as_i64)
-                .map(|i| {to_countdown(i, now_sec - today_sec, false, train_name)});
-
-            if time.is_some() {
-                routes.push(time.unwrap());
-            }
+    let (core_res, status_res) = match alert_line {
+        Some(line) => {
+            let (core, alerts) = tokio::join!(
+                fetch_countdown_core(&client, &state, &station),
+                fetch_alerts(&client, &state, line)
+            );
+            (core, Some(alerts))
         }
-        if route_times.contains_key(&route.to_string()) {
-            let all_routes = route_times.get_mut(&route.to_string()).unwrap();
-            for time in routes {
-                all_routes.push(time);
-            }
-        } else {
-            route_times.insert(route.to_string(), routes);
-        }
-    }
-    for routes in route_times.values_mut() {
-        routes.sort_by_key(|r| r.seconds);
-    }
-    let stop_name = item.get("stop").and_then(Value::as_object)
-        .and_then(|stop| { stop.get("name") }).and_then(Value::as_str)
-        .unwrap_or("error");
+        None => (fetch_countdown_core(&client, &state, &station).await, None),
+    };
 
-    Some(Countdown {
-        name : stop_name.to_string(),
-        // TODO actually use alerts
-        alerts : alerts,
-        status: train_status.await.unwrap(),
-        route_times : route_times
-    })
+    let core = core_res?;
+    let status = match status_res {
+        Some(Ok(s)) => (*s).clone(),
+        Some(Err(err)) => {
+            log::warn!("degrading alert status for {}: {}", station, err);
+            TrainStatus::unknown()
+        }
+        None => TrainStatus::unknown(),
+    };
+
+    let response = Countdown {
+        name: core.name.clone(),
+        alerts: core.alerts.clone(),
+        status,
+        route_times: core.route_times.clone(),
+    };
+
+    Ok(HttpResponse::Ok()
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .json(&response))
 }
 
-async fn favicon() -> Result<NamedFile> {
-    Ok(NamedFile::open("static/favicon.ico")?)
+#[get("/favicon.ico")]
+async fn favicon() -> HttpResponse {
+    HttpResponse::NoContent().finish()
+}
+
+fn security_headers() -> DefaultHeaders {
+    DefaultHeaders::new()
+        .add(("X-Content-Type-Options", "nosniff"))
+        .add(("X-Frame-Options", "DENY"))
+        .add(("Referrer-Policy", "no-referrer"))
+        .add(("Content-Security-Policy", CSP_HEADER))
+}
+
+fn configure_app(cfg: &mut web::ServiceConfig) {
+    cfg.service(mta)
+        .service(countdown)
+        .service(train_alerts)
+        .service(favicon)
+        .service(
+            web::scope("/mta/static")
+                .wrap(DefaultHeaders::new().add(("Cache-Control", "public, max-age=3600")))
+                .service(actix_files::Files::new("", "./static")),
+        );
+}
+
+fn build_http_client() -> Client {
+    Client::builder()
+        .add_default_header((header::USER_AGENT, "mta-kindle/0.1"))
+        .timeout(UPSTREAM_TIMEOUT)
+        .connector(Connector::new())
+        .finish()
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    lazy_static::initialize(&API_KEY);
-    let client_tls_config = Arc::new(rustls_config());
-    HttpServer::new(move || {
-        // create client _inside_ `HttpServer::new` closure to have one per worker thread
-        let client = Client::builder()
-            // Wikipedia requires a User-Agent header to make requests
-            .add_default_header((header::USER_AGENT, "awc-example/1.0"))
-            // a "connector" wraps the stream into an encrypted connection
-            .connector(Connector::new().rustls(Arc::clone(&client_tls_config)))
-            .finish();
+    dotenvy::dotenv().ok();
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
 
+    let api_key = std::env::var("API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "API_KEY environment variable is required",
+            )
+        })?;
+
+    let bind_addr = std::env::var("BIND_ADDR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+
+    let mta_base_url = std::env::var("MTA_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://otp-mta-prod.camsys-apps.com".to_string());
+
+    let goodservice_base_url = std::env::var("GOODSERVICE_BASE_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://www.goodservice.io".to_string());
+
+    let state = Data::new(AppState::new(
+        api_key,
+        mta_base_url,
+        goodservice_base_url,
+        parse_valid_stops(STOPS_TXT),
+        DEFAULT_CACHE_TTL,
+    ));
+
+    HttpServer::new(move || {
         App::new()
-            .app_data(Data::new(client))
+            .app_data(state.clone())
+            .app_data(Data::new(build_http_client()))
+            .wrap(middleware::Compress::default())
             .wrap(middleware::Logger::default())
-            .service(mta)
-            .service(get_time)
-            .service(countdown)
-            .service(train_alerts)
-            .service(web::resource("/favicon.ico").route(web::get().to(favicon)))
-            .service(actix_files::Files::new("/static", "./static"))
-            .service(actix_files::Files::new("/mta/static", "./static"))
+            .wrap(security_headers())
+            .configure(configure_app)
     })
-    .bind(("127.0.0.1", 8080))?
-    .workers(5)
+    .bind(&bind_addr)?
+    .workers(2)
     .run()
     .await
 }
 
-/// Create simple rustls client config from root certificates.
-fn rustls_config() -> ClientConfig {
-    let mut root_store = RootCertStore::empty();
-    root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-        OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use actix_web::{http::StatusCode, HttpRequest};
 
-    rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
+    #[test]
+    fn test_validation_helpers() {
+        let stops = parse_valid_stops(STOPS_TXT);
+        assert!(stops.len() >= 470);
+        assert!(is_valid_station("L08", &stops));
+        assert!(is_valid_station("A32", &stops));
+        assert!(is_valid_station("901", &stops));
+
+        assert!(!is_valid_station("", &stops));
+        assert!(!is_valid_station("ZZZ", &stops));
+        assert!(!is_valid_station("../", &stops));
+        assert!(!is_valid_station("L08&x=1", &stops));
+        assert!(!is_valid_station("L08#a", &stops));
+        assert!(!is_valid_station("é08", &stops));
+
+        assert!(is_valid_train("L"));
+        assert!(is_valid_train("4"));
+        assert!(is_valid_train("6X"));
+        assert!(is_valid_train("GS"));
+        assert!(!is_valid_train(""));
+        assert!(!is_valid_train("../"));
+        assert!(!is_valid_train("L?x=1"));
+        assert!(!is_valid_train("é"));
+        assert!(!is_valid_train("INVALID"));
+
+        assert_eq!(station_alert_line("L08"), Some("L"));
+        assert_eq!(station_alert_line("901"), Some("GS"));
+        assert_eq!(station_alert_line("H01"), Some("H"));
+        assert_eq!(station_alert_line(""), None);
+        assert_eq!(station_alert_line("é08"), None);
+    }
+
+    #[test]
+    fn test_to_countdown() {
+        let normal = to_countdown(3600 * 13 + 5 * 60, 3600 * 13, false, "L");
+        assert_eq!(normal.seconds, 300);
+        assert_eq!(normal.mins, 5);
+        assert_eq!(normal.time, "1:05");
+        assert_eq!(normal.train_name, "L");
+
+        // Midnight wraparound: arrival at 00:05 (300s) when now is 23:55 (86100s)
+        let wrap = to_countdown(300, 86100, false, "4");
+        assert_eq!(wrap.seconds, 600);
+        assert_eq!(wrap.mins, 10);
+        assert_eq!(wrap.time, "12:05");
+
+        // Noon formatting
+        let noon = to_countdown(3600 * 12 + 30 * 60, 3600 * 12, false, "A");
+        assert_eq!(noon.time, "12:30");
+    }
+
+    #[actix_web::test]
+    async fn test_ttl_cache_coalescing_and_bounds() {
+        let cache = Arc::new(TtlCache::new(Duration::from_millis(80), 2));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // 10 concurrent misses for the same key must coalesce to 1 loader invocation
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let c = cache.clone();
+            let n = calls.clone();
+            handles.push(tokio::spawn(async move {
+                c.get_or_try_insert_with::<&'static str, _, _>("k1", || async {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    Ok(100)
+                })
+                .await
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap().unwrap(), 100);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Cache hit within TTL
+        let v = cache
+            .get_or_try_insert_with::<&'static str, _, _>("k1", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(200)
+            })
+            .await
+            .unwrap();
+        assert_eq!(v, 100);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Wait for TTL expiry
+        tokio::time::sleep(Duration::from_millis(95)).await;
+        let v2 = cache
+            .get_or_try_insert_with::<&'static str, _, _>("k1", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(300)
+            })
+            .await
+            .unwrap();
+        assert_eq!(v2, 300);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Bounded eviction (max_entries = 2)
+        cache
+            .get_or_try_insert_with::<&'static str, _, _>("k2", || async { Ok(2) })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        cache
+            .get_or_try_insert_with::<&'static str, _, _>("k3", || async { Ok(3) })
+            .await
+            .unwrap();
+        let guard = cache.entries.lock().unwrap();
+        assert!(guard.len() <= 2);
+        assert!(!guard.contains_key("k1"));
+    }
+
+    #[derive(Clone)]
+    struct MockCounters {
+        mta_hits: Arc<AtomicUsize>,
+        alerts_hits: Arc<AtomicUsize>,
+        last_mta_query: Arc<Mutex<String>>,
+        mta_mode: Arc<Mutex<&'static str>>,
+        alerts_mode: Arc<Mutex<&'static str>>,
+    }
+
+    impl MockCounters {
+        fn new() -> Self {
+            Self {
+                mta_hits: Arc::new(AtomicUsize::new(0)),
+                alerts_hits: Arc::new(AtomicUsize::new(0)),
+                last_mta_query: Arc::new(Mutex::new(String::new())),
+                mta_mode: Arc::new(Mutex::new("ok")),
+                alerts_mode: Arc::new(Mutex::new("ok")),
+            }
+        }
+    }
+
+    async fn spawn_mock_upstream(counters: MockCounters) -> (String, actix_web::dev::ServerHandle) {
+        let server = HttpServer::new(move || {
+            let c = counters.clone();
+            App::new()
+                .app_data(Data::new(c))
+                .route(
+                    "/api/routes/{train}",
+                    web::get().to(|c: Data<MockCounters>| async move {
+                        c.alerts_hits.fetch_add(1, Ordering::SeqCst);
+                        let mode = *c.alerts_mode.lock().unwrap();
+                        match mode {
+                            "500" => HttpResponse::InternalServerError().body("upstream err"),
+                            "bad_json" => HttpResponse::Ok().body("{not json"),
+                            _ => HttpResponse::Ok().content_type("application/json").body(
+                                r#"{
+                                    "status": "Delays",
+                                    "service_change_summaries": {
+                                        "both": ["Slow speeds"],
+                                        "north": ["Skip 1st Ave"],
+                                        "south": []
+                                    },
+                                    "service_irregularity_summaries": {
+                                        "north": "Signal problem",
+                                        "south": null
+                                    }
+                                }"#,
+                            ),
+                        }
+                    }),
+                )
+                .route(
+                    "/otp/routers/default/nearby",
+                    web::get().to(|req: HttpRequest, c: Data<MockCounters>| async move {
+                        c.mta_hits.fetch_add(1, Ordering::SeqCst);
+                        *c.last_mta_query.lock().unwrap() = req.query_string().to_string();
+                        let mode = *c.mta_mode.lock().unwrap();
+                        let now_ms = unix_now_secs() * 1000;
+                        match mode {
+                            "500" => HttpResponse::InternalServerError().body("mta err"),
+                            "bad_json" => HttpResponse::Ok().body("{bad"),
+                            "empty" => HttpResponse::Ok().content_type("application/json").body("[]"),
+                            _ => {
+                                let body = format!(
+                                    r#"[{{
+                                        "stop": {{"name": "Bedford Av"}},
+                                        "alerts": [
+                                            {{
+                                                "effectiveStartDate": {},
+                                                "effectiveEndDate": {},
+                                                "alertHeaderText": "Active alert",
+                                                "humanReadableActivePeriod": "Now"
+                                            }},
+                                            {{
+                                                "effectiveStartDate": 1000,
+                                                "effectiveEndDate": 2000,
+                                                "alertHeaderText": "Expired alert",
+                                                "humanReadableActivePeriod": "Past"
+                                            }}
+                                        ],
+                                        "groups": [
+                                            {{
+                                                "headsign": "Manhattan",
+                                                "route": {{"shortName": "L"}},
+                                                "times": [
+                                                    {{"serviceDay": 0, "realtimeArrival": 600}},
+                                                    {{"serviceDay": 0, "realtimeArrival": 300}}
+                                                ]
+                                            }}
+                                        ]
+                                    }}]"#,
+                                    now_ms - 60_000,
+                                    now_ms + 3600_000
+                                );
+                                HttpResponse::Ok().content_type("application/json").body(body)
+                            }
+                        }
+                    }),
+                )
+        })
+        .bind(("127.0.0.1", 0))
+        .unwrap();
+
+        let port = server.addrs()[0].port();
+        let running = server.run();
+        let handle = running.handle();
+        actix_web::rt::spawn(running);
+        (format!("http://127.0.0.1:{}", port), handle)
+    }
+
+    #[actix_web::test]
+    async fn test_http_routes_security_and_caching() {
+        let counters = MockCounters::new();
+        let (base_url, handle) = spawn_mock_upstream(counters.clone()).await;
+
+        let state = Data::new(AppState::new(
+            "test-secret-key".to_string(),
+            base_url.clone(),
+            base_url,
+            parse_valid_stops(STOPS_TXT),
+            Duration::from_secs(30),
+        ));
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(state)
+                .app_data(Data::new(build_http_client()))
+                .wrap(security_headers())
+                .configure(configure_app),
+        )
+        .await;
+
+        // 1. Index HTML + Security Headers + No inline onclick
+        let req = actix_web::test::TestRequest::get().uri("/").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            resp.headers().get("X-Content-Type-Options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(resp.headers().get("X-Frame-Options").unwrap(), "DENY");
+        assert!(resp.headers().get("Content-Security-Policy").is_some());
+        let html_body = actix_web::test::read_body(resp).await;
+        let html_str = std::str::from_utf8(&html_body).unwrap();
+        assert!(!html_str.contains("onclick="));
+
+        // 2. Favicon returns 204
+        let req = actix_web::test::TestRequest::get().uri("/favicon.ico").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // 3. Static files + Cache-Control
+        for path in [
+            "/mta/static/js/js.js",
+            "/mta/static/css/styles.css",
+            "/mta/static/js/stops.txt",
+        ] {
+            let req = actix_web::test::TestRequest::get().uri(path).to_request();
+            let resp = actix_web::test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::OK, "failed static {}", path);
+            assert!(resp.headers().get(header::CACHE_CONTROL).is_some());
+        }
+
+        // 4. Invalid train & invalid station rejected BEFORE upstream hits
+        for bad_alert in [
+            "/mta/alerts/INVALID",
+            "/mta/alerts/../etc",
+            "/mta/alerts/L%3Fx=1",
+            "/mta/alerts/%C3%A9",
+        ] {
+            let req = actix_web::test::TestRequest::get().uri(bad_alert).to_request();
+            let resp = actix_web::test::call_service(&app, req).await;
+            assert!(
+                resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::NOT_FOUND,
+                "unexpected status for {}: {}",
+                bad_alert,
+                resp.status()
+            );
+        }
+        for bad_station in [
+            "/mta/countdown/",
+            "/mta/countdown/ZZZ",
+            "/mta/countdown/L08%26apikey=evil",
+            "/mta/countdown/%C3%A908",
+            "/mta/countdown/../L08",
+        ] {
+            let req = actix_web::test::TestRequest::get().uri(bad_station).to_request();
+            let resp = actix_web::test::call_service(&app, req).await;
+            assert!(
+                resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::NOT_FOUND,
+                "unexpected status for {}: {}",
+                bad_station,
+                resp.status()
+            );
+        }
+        assert_eq!(counters.alerts_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.mta_hits.load(Ordering::SeqCst), 0);
+
+        // 5. Valid alerts request + caching
+        let req = actix_web::test::TestRequest::get().uri("/mta/alerts/4").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert_eq!(body["status"], "Delays");
+        assert_eq!(body["alerts"].as_array().unwrap().len(), 3);
+        assert_eq!(counters.alerts_hits.load(Ordering::SeqCst), 1);
+
+        // Second hit uses cache
+        let req = actix_web::test::TestRequest::get().uri("/mta/alerts/4").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(counters.alerts_hits.load(Ordering::SeqCst), 1);
+
+        // 6. Countdown with ?alerts=0 skips goodservice.io
+        let req = actix_web::test::TestRequest::get()
+            .uri("/mta/countdown/L08?alerts=0")
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(counters.mta_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.alerts_hits.load(Ordering::SeqCst), 1); // unchanged
+        assert_eq!(
+            *counters.last_mta_query.lock().unwrap(),
+            "stops=MTASBWY%3AL08&apikey=test-secret-key"
+        );
+        let cd: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert_eq!(cd["name"], "Bedford Av");
+        assert_eq!(cd["status"]["status"], "?");
+        assert_eq!(cd["alerts"].as_array().unwrap().len(), 1);
+        let times = cd["route_times"]["Manhattan"].as_array().unwrap();
+        assert!(times[0]["seconds"].as_i64().unwrap() <= times[1]["seconds"].as_i64().unwrap());
+
+        // 7. Countdown with alerts fetches goodservice.io for L while reusing MTA cache
+        let req = actix_web::test::TestRequest::get().uri("/mta/countdown/L08").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(counters.mta_hits.load(Ordering::SeqCst), 1); // cached
+        assert_eq!(counters.alerts_hits.load(Ordering::SeqCst), 2);
+        let cd2: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert_eq!(cd2["status"]["status"], "Delays");
+
+        // 8. Degraded goodservice.io does not break countdown
+        *counters.alerts_mode.lock().unwrap() = "500";
+        let req = actix_web::test::TestRequest::get().uri("/mta/countdown/A32").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cd3: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert_eq!(cd3["status"]["status"], "?");
+
+        // 9. Upstream alerts 500 -> 502
+        let req = actix_web::test::TestRequest::get().uri("/mta/alerts/A").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        // 10. Upstream MTA empty -> 404, bad_json -> 502, 500 -> 502
+        *counters.mta_mode.lock().unwrap() = "empty";
+        let req = actix_web::test::TestRequest::get().uri("/mta/countdown/101?alerts=0").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        *counters.mta_mode.lock().unwrap() = "bad_json";
+        let req = actix_web::test::TestRequest::get().uri("/mta/countdown/103?alerts=0").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        *counters.mta_mode.lock().unwrap() = "500";
+        let req = actix_web::test::TestRequest::get().uri("/mta/countdown/104?alerts=0").to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        handle.stop(true).await;
+    }
 }

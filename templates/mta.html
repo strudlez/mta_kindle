@@ -1,14 +1,15 @@
+<!DOCTYPE html>
 <html>
   <head>
+    <meta charset="utf-8">
     <title>Countdown</title>
     <link rel="stylesheet" href="mta/static/css/styles.css">
-    <script src="mta/static/js/js.js"></script>
   </head>
   <body>
     <div class="body" id="main">
       <div id="stations">
         <div id="station0" class="hidden">
-          <div class="stationTitle" onclick="showPicker()" style="cursor: pointer;"></div>
+          <div class="stationTitle"></div>
           <div class="directions">
             <div class="inbound direction">
               <div class="inboundTitle"></div>
@@ -58,7 +59,7 @@
         <div class="alertsBody"></div>
       </div>
     </div>
-    
+
     <div class="body hidden" id="picker">
       <div id="pickerTitle">Manage Stations</div>
       <div id="pickerList"></div>
@@ -66,12 +67,13 @@
         <select id="pickerSelect">
           <option value="">Select a station...</option>
         </select>
-        <button class="picker-btn" onclick="addStation()">Add</button>
+        <button id="addStationBtn" class="picker-btn" type="button">Add</button>
       </div>
       <div class="picker-controls">
-        <button class="picker-btn" onclick="savePicker()">Save</button>
-        <button class="picker-btn" onclick="hidePicker()">Cancel</button>
+        <button id="savePickerBtn" class="picker-btn" type="button">Save</button>
+        <button id="hidePickerBtn" class="picker-btn" type="button">Cancel</button>
       </div>
     </div>
+    <script src="mta/static/js/js.js"></script>
   </body>
 </html>
