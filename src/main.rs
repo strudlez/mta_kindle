@@ -266,6 +266,18 @@ struct CountdownQuery {
     alerts: Option<u8>,
 }
 
+#[derive(Deserialize, Debug, Default)]
+struct BatchQuery {
+    stations: String,
+    extra: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct BatchResponse {
+    stations: HashMap<String, Countdown>,
+    extra_alert: Option<TrainStatus>,
+}
+
 fn parse_valid_stops(csv: &str) -> HashSet<String> {
     csv.lines()
         .skip(1)
@@ -566,6 +578,134 @@ async fn countdown(
         .json(&response))
 }
 
+#[get("/mta/batch")]
+async fn batch(
+    query: web::Query<BatchQuery>,
+    client: Data<Client>,
+    state: Data<AppState>,
+) -> Result<HttpResponse> {
+    let station_ids: Vec<String> = query
+        .stations
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+    if station_ids.is_empty()
+        || station_ids.len() > 10
+        || station_ids
+            .iter()
+            .any(|s| !is_valid_station(s, &state.valid_stops))
+    {
+        return Err(actix_web::error::ErrorBadRequest("invalid stations"));
+    }
+
+    let extra_train = match query.extra.as_deref().map(str::trim) {
+        Some(t) if !t.is_empty() => {
+            if !is_valid_train(t) {
+                return Err(actix_web::error::ErrorBadRequest("invalid extra train"));
+            }
+            Some(t.to_string())
+        }
+        _ => None,
+    };
+
+    let mut station_handles = Vec::with_capacity(station_ids.len());
+    for st in &station_ids {
+        let c = client.clone();
+        let s = state.clone();
+        let st_owned = st.clone();
+        station_handles.push((
+            st_owned.clone(),
+            actix_web::rt::spawn(async move {
+                fetch_countdown_core(&c, &s, &st_owned).await
+            }),
+        ));
+    }
+
+    let primary_alert_handle = station_alert_line(&station_ids[0]).map(|line| {
+        let c = client.clone();
+        let s = state.clone();
+        actix_web::rt::spawn(async move { fetch_alerts(&c, &s, line).await })
+    });
+
+    let extra_alert_handle = extra_train.as_ref().map(|train| {
+        let c = client.clone();
+        let s = state.clone();
+        let t = train.clone();
+        actix_web::rt::spawn(async move { fetch_alerts(&c, &s, &t).await })
+    });
+
+    let primary_status = match primary_alert_handle {
+        Some(handle) => match handle.await {
+            Ok(Ok(s)) => (*s).clone(),
+            Ok(Err(err)) => {
+                log::warn!("degrading primary batch alert for {}: {}", station_ids[0], err);
+                TrainStatus::unknown()
+            }
+            Err(err) => {
+                log::warn!("primary batch alert task failed: {}", err);
+                TrainStatus::unknown()
+            }
+        },
+        None => TrainStatus::unknown(),
+    };
+
+    let mut stations_map = HashMap::with_capacity(station_handles.len());
+    for (idx, (st, handle)) in station_handles.into_iter().enumerate() {
+        match handle.await {
+            Ok(Ok(core)) => {
+                let status = if idx == 0 {
+                    primary_status.clone()
+                } else {
+                    TrainStatus::unknown()
+                };
+                stations_map.insert(
+                    st,
+                    Countdown {
+                        name: core.name.clone(),
+                        alerts: core.alerts.clone(),
+                        status,
+                        route_times: core.route_times.clone(),
+                    },
+                );
+            }
+            Ok(Err(err)) => {
+                log::warn!("batch countdown failed for {}: {}", st, err);
+            }
+            Err(err) => {
+                log::warn!("batch countdown task panicked for {}: {}", st, err);
+            }
+        }
+    }
+
+    if stations_map.is_empty() {
+        return Err(actix_web::error::ErrorBadGateway("upstream error"));
+    }
+
+    let extra_alert = match extra_alert_handle {
+        Some(handle) => match handle.await {
+            Ok(Ok(s)) => Some((*s).clone()),
+            Ok(Err(err)) => {
+                log::warn!("degrading extra batch alert: {}", err);
+                None
+            }
+            Err(err) => {
+                log::warn!("extra batch alert task failed: {}", err);
+                None
+            }
+        },
+        None => None,
+    };
+
+    let response = BatchResponse {
+        stations: stations_map,
+        extra_alert,
+    };
+
+    Ok(HttpResponse::Ok()
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .json(&response))
+}
+
 #[get("/favicon.ico")]
 async fn favicon() -> HttpResponse {
     HttpResponse::NoContent().finish()
@@ -583,9 +723,15 @@ fn configure_app(cfg: &mut web::ServiceConfig) {
     cfg.service(mta)
         .service(countdown)
         .service(train_alerts)
+        .service(batch)
         .service(favicon)
         .service(
             web::scope("/mta/static")
+                .wrap(DefaultHeaders::new().add(("Cache-Control", "public, max-age=3600")))
+                .service(actix_files::Files::new("", "./static")),
+        )
+        .service(
+            web::scope("/static")
                 .wrap(DefaultHeaders::new().add(("Cache-Control", "public, max-age=3600")))
                 .service(actix_files::Files::new("", "./static")),
         );
@@ -930,11 +1076,13 @@ mod tests {
         let resp = actix_web::test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-        // 3. Static files + Cache-Control
+        // 3. Static files + Cache-Control (both /mta/static and /static for reverse proxies)
         for path in [
             "/mta/static/js/js.js",
             "/mta/static/css/styles.css",
             "/mta/static/js/stops.txt",
+            "/static/js/js.js",
+            "/static/css/styles.css",
         ] {
             let req = actix_web::test::TestRequest::get().uri(path).to_request();
             let resp = actix_web::test::call_service(&app, req).await;
@@ -1056,6 +1204,39 @@ mod tests {
         let req = actix_web::test::TestRequest::get().uri("/mta/countdown/104?alerts=0").to_request();
         let resp = actix_web::test::call_service(&app, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        // 11. /mta/batch validation and single-request fan-out
+        *counters.mta_mode.lock().unwrap() = "ok";
+        *counters.alerts_mode.lock().unwrap() = "ok";
+        let hits_before_bad = counters.mta_hits.load(Ordering::SeqCst);
+        for bad_batch in [
+            "/mta/batch?stations=",
+            "/mta/batch?stations=ZZZ",
+            "/mta/batch?stations=L13,INVALID",
+            "/mta/batch?stations=L13&extra=BAD",
+            "/mta/batch?stations=L13,M12,G30,L08,A32,101,103,104,106,901,R14",
+        ] {
+            let req = actix_web::test::TestRequest::get().uri(bad_batch).to_request();
+            let resp = actix_web::test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "expected 400 for {}", bad_batch);
+        }
+        assert_eq!(counters.mta_hits.load(Ordering::SeqCst), hits_before_bad);
+
+        let alerts_before_batch = counters.alerts_hits.load(Ordering::SeqCst);
+        let req = actix_web::test::TestRequest::get()
+            .uri("/mta/batch?stations=L13,M12,G30&extra=F")
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let batch_json: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert!(batch_json["stations"]["L13"].is_object());
+        assert!(batch_json["stations"]["M12"].is_object());
+        assert!(batch_json["stations"]["G30"].is_object());
+        assert_eq!(batch_json["stations"]["M12"]["status"]["status"], "?");
+        assert_eq!(batch_json["stations"]["G30"]["status"]["status"], "?");
+        assert_eq!(batch_json["extra_alert"]["status"], "Delays");
+        // Only F (extra) should have been fetched since L was already cached earlier; M and G were skipped
+        assert_eq!(counters.alerts_hits.load(Ordering::SeqCst), alerts_before_batch + 1);
 
         handle.stop(true).await;
     }

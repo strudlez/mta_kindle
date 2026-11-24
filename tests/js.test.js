@@ -182,6 +182,9 @@ function buildStationTemplate() {
 
 function setupEnvironment(locationOpts = {}) {
   const xhrRequests = [];
+  const timers = [];
+  let nextTimerId = 1;
+  let reloadCount = 0;
   const root = new MockElement('body');
 
   const main = new MockElement('div');
@@ -239,6 +242,9 @@ function setupEnvironment(locationOpts = {}) {
     location: {
       search: locationOpts.search || '',
       hash: locationOpts.hash || '',
+      reload() {
+        reloadCount += 1;
+      },
     },
     listeners: {},
     addEventListener(type, fn) {
@@ -246,7 +252,15 @@ function setupEnvironment(locationOpts = {}) {
       this.listeners[type].push(fn);
     },
     setInterval: () => 1,
-    setTimeout: (fn) => { fn(); return 1; },
+    setTimeout(fn, delay) {
+      const id = nextTimerId++;
+      timers.push({ id, fn, delay, cleared: false });
+      return id;
+    },
+    clearTimeout(id) {
+      const t = timers.find((x) => x.id === id);
+      if (t) t.cleared = true;
+    },
   };
 
   class MockXHR {
@@ -255,9 +269,14 @@ function setupEnvironment(locationOpts = {}) {
       this.url = url;
       this.status = 200;
       this.responseText = '';
+      this.aborted = false;
     }
     send() {
       xhrRequests.push(this);
+    }
+    abort() {
+      this.aborted = true;
+      if (typeof this.onabort === 'function') this.onabort();
     }
   }
 
@@ -268,7 +287,17 @@ function setupEnvironment(locationOpts = {}) {
 
   delete require.cache[require.resolve(JS_PATH)];
   const app = require(JS_PATH);
-  return { app, xhrRequests, root, mockWindow, mockDocument, pickerList, pickerSelect };
+  return {
+    app,
+    xhrRequests,
+    timers,
+    getReloadCount: () => reloadCount,
+    root,
+    mockWindow,
+    mockDocument,
+    pickerList,
+    pickerSelect,
+  };
 }
 
 describe('Kindle Compatibility & Static Checks', () => {
@@ -286,9 +315,9 @@ describe('Kindle Compatibility & Static Checks', () => {
     expect(code).not.toContain('??');
   });
 
-  test('mta.html has DOCTYPE, no inline handlers/styles, and script in body', () => {
+  test('mta.html stays in Quirks Mode for Kindle, has no inline handlers/styles, and script in body', () => {
     const html = fs.readFileSync(HTML_PATH, 'utf8');
-    expect(html.trimStart().startsWith('<!DOCTYPE html>')).toBe(true);
+    expect(html.toUpperCase()).not.toContain('<!DOCTYPE');
     expect(html).not.toMatch(/\bonclick\s*=/i);
     expect(html).not.toMatch(/\bstyle\s*=/i);
     const headClose = html.indexOf('</head>');
@@ -296,10 +325,11 @@ describe('Kindle Compatibility & Static Checks', () => {
     expect(scriptPos).toBeGreaterThan(headClose);
   });
 
-  test('styles.css uses px units, valid properties, and no flexbox/grid', () => {
+  test('styles.css uses px units, pre-line alerts, valid properties, and no flexbox/grid', () => {
     const css = fs.readFileSync(CSS_PATH, 'utf8');
     expect(css).not.toContain('float: center');
     expect(css).not.toMatch(/\.trainNam\b/);
+    expect(css).toContain('white-space: pre-line');
     expect(css).not.toMatch(/display:\s*(flex|grid)/i);
     expect(css).not.toMatch(/(font-size|height)\s*:\s*\d+\s*;/);
   });
@@ -356,6 +386,7 @@ describe('Frontend Logic, Security & Performance', () => {
     expect(env.pickerList.children.length).toBe(2);
     expect(env.pickerList.children[0].querySelector('.picker-item-name').textContent).toBe(xssPayload);
 
+    env.app.loadTimes('L08', env.root.querySelector('#station0'), true);
     const cdReq = env.xhrRequests.find((r) => r.url.includes('/mta/countdown/'));
     cdReq.status = 200;
     cdReq.responseText = JSON.stringify({
@@ -375,6 +406,7 @@ describe('Frontend Logic, Security & Performance', () => {
     expect(s0.querySelector('.outboundTitle').textContent).toBe(xssPayload);
     expect(s0.querySelector('.outbound1').querySelector('.trainName').textContent).toBe(xssPayload);
 
+    env.app.loadAlert2();
     const a2Req = env.xhrRequests.find((r) => r.url.includes('/mta/alerts/'));
     a2Req.status = 200;
     a2Req.responseText = JSON.stringify({ status: xssPayload, alerts: [xssPayload] });
@@ -385,23 +417,37 @@ describe('Frontend Logic, Security & Performance', () => {
     expect(a2.querySelector('.alertsTitle').textContent).toBe(`4: ${xssPayload}`);
   });
 
-  test('secondary stations pass ?alerts=0 and dirty-checking skips unchanged DOM writes', () => {
+  test('batch polling uses 1 request, falls back to staggered on 404, and dirty-checks DOM writes', () => {
     env = setupEnvironment({ hash: '#L08,A32&4' });
-    const cdReqs = env.xhrRequests.filter((r) => r.url.includes('/mta/countdown/'));
-    expect(cdReqs.map((r) => r.url)).toEqual(['/mta/countdown/L08', '/mta/countdown/A32?alerts=0']);
+    const batchReqs = env.xhrRequests.filter((r) => r.url.startsWith('/mta/batch'));
+    expect(batchReqs.length).toBe(1);
+    expect(batchReqs[0].url).toBe('/mta/batch?stations=L08,A32&extra=4');
 
-    const payload = JSON.stringify({
-      name: 'Bedford Av',
-      alerts: [],
-      status: { status: 'Good Service', alerts: [] },
-      route_times: {
-        Manhattan: [{ seconds: 120, mins: 2, time: '1:02', estimated: false, train_name: 'LX' }],
+    const batchPayload = JSON.stringify({
+      stations: {
+        L08: {
+          name: 'Bedford Av',
+          alerts: [],
+          status: { status: 'Good Service', alerts: [] },
+          route_times: {
+            Manhattan: [{ seconds: 120, mins: 2, time: '1:02', estimated: false, train_name: 'LX' }],
+          },
+        },
+        A32: {
+          name: 'W 4 St-Wash Sq',
+          alerts: [],
+          status: { status: '?', alerts: [] },
+          route_times: {
+            Uptown: [{ seconds: 180, mins: 3, time: '1:03', estimated: false, train_name: 'A' }],
+          },
+        },
       },
+      extra_alert: { status: 'Delays', alerts: ['4 delayed'] },
     });
 
-    cdReqs[0].status = 200;
-    cdReqs[0].responseText = payload;
-    cdReqs[0].onload();
+    batchReqs[0].status = 200;
+    batchReqs[0].responseText = batchPayload;
+    batchReqs[0].onload();
 
     const s0 = env.root.querySelector('#station0');
     const titleEl = s0.querySelector('.stationTitle');
@@ -409,30 +455,92 @@ describe('Frontend Logic, Security & Performance', () => {
     const writesAfterFirst = titleEl.textWrites;
     const countWritesAfterFirst = countEl.textWrites;
 
-    // Second identical poll causes zero redundant textContent writes
-    env.app.loadTimesFromUrl();
-    const secondReq = env.xhrRequests.filter((r) => r.url === '/mta/countdown/L08')[1];
-    secondReq.status = 200;
-    secondReq.responseText = payload;
-    secondReq.onload();
+    // Second identical batch poll causes zero redundant textContent writes
+    env.app.refreshAll();
+    const secondBatch = env.xhrRequests.filter((r) => r.url.startsWith('/mta/batch'))[1];
+    secondBatch.status = 200;
+    secondBatch.responseText = batchPayload;
+    secondBatch.onload();
 
     expect(titleEl.textWrites).toBe(writesAfterFirst);
     expect(countEl.textWrites).toBe(countWritesAfterFirst);
+
+    // 404 on /mta/batch falls back to sequential staggered /mta/countdown/ + /mta/alerts/
+    env.app.refreshAll();
+    const thirdBatch = env.xhrRequests.filter((r) => r.url.startsWith('/mta/batch'))[2];
+    thirdBatch.status = 404;
+    thirdBatch.onload();
+    expect(env.app.getState().batchSupported).toBe(false);
+
+    // First staggered step requests only station 0 (not station 1 or alert2 yet)
+    const after404 = env.xhrRequests.slice(3);
+    expect(after404.map((r) => r.url)).toEqual(['/mta/countdown/L08']);
+    after404[0].status = 200;
+    after404[0].responseText = JSON.stringify({
+      name: 'Bedford Av',
+      alerts: [],
+      status: { status: 'Good Service', alerts: [] },
+      route_times: {},
+    });
+    after404[0].onload();
+
+    // Run stagger timer -> triggers station 1 with ?alerts=0
+    const pendingStagger = env.timers.filter((t) => !t.cleared && t.delay === 500);
+    expect(pendingStagger.length).toBe(1);
+    pendingStagger[0].fn();
+    expect(env.xhrRequests[env.xhrRequests.length - 1].url).toBe('/mta/countdown/A32?alerts=0');
+  });
+
+  test('overlapping poll aborts hung XHR, 15s watchdog aborts, and 6h reload skips when picker is open', () => {
+    const firstBatch = env.xhrRequests[0];
+    expect(firstBatch.aborted).toBe(false);
+
+    // Next poll tick aborts the still-pending first request
+    env.app.refreshAll();
+    expect(firstBatch.aborted).toBe(true);
+
+    // 15s watchdog timer aborts hung second request
+    const secondBatch = env.xhrRequests[1];
+    const watchdog = env.timers.find((t) => !t.cleared && t.delay === 15000);
+    expect(watchdog).toBeDefined();
+    watchdog.fn();
+    expect(secondBatch.aborted).toBe(true);
+
+    // Safe 6h periodic reload: skipped while picker is open, fires when closed after healthy response
+    env.app.setState({
+      pageLoadedAt: Date.now() - 7 * 60 * 60 * 1000,
+      pickerOpen: true,
+    });
+    expect(env.app.maybePeriodicReload()).toBe(false);
+    expect(env.getReloadCount()).toBe(0);
+
+    env.app.setState({ pickerOpen: false });
+    env.app.refreshAll();
+    const healthyBatch = env.xhrRequests[env.xhrRequests.length - 1];
+    healthyBatch.status = 200;
+    healthyBatch.responseText = JSON.stringify({ stations: {}, extra_alert: null });
+    healthyBatch.onload();
+    expect(env.getReloadCount()).toBe(1);
   });
 
   test('handles closed stations, non-200 status, malformed JSON, and hashChange safely', () => {
-    const cdReq = env.xhrRequests.find((r) => r.url.includes('/mta/countdown/'));
+    const batchReq = env.xhrRequests.find((r) => r.url.startsWith('/mta/batch'));
 
-    // Non-200 and malformed JSON do not throw
-    cdReq.status = 502;
-    cdReq.responseText = 'Bad Gateway';
-    expect(() => cdReq.onload()).not.toThrow();
+    // Non-200 (502) and malformed JSON do not throw
+    batchReq.status = 502;
+    batchReq.responseText = 'Bad Gateway';
+    expect(() => batchReq.onload()).not.toThrow();
 
-    cdReq.status = 200;
-    cdReq.responseText = '{bad json';
-    expect(() => cdReq.onload()).not.toThrow();
+    env.app.refreshAll();
+    const batchReq2 = env.xhrRequests[env.xhrRequests.length - 1];
+    batchReq2.status = 200;
+    batchReq2.responseText = '{bad json';
+    expect(() => batchReq2.onload()).not.toThrow();
 
     // Closed station hides all rows cleanly
+    env.app.loadTimes('L08', env.root.querySelector('#station0'), true);
+    const cdReq = env.xhrRequests[env.xhrRequests.length - 1];
+    cdReq.status = 200;
     cdReq.responseText = JSON.stringify({
       name: 'Closed St',
       alerts: [],

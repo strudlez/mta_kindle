@@ -12,6 +12,17 @@
   var stationTemplate = null;
   var stationRefs = [];
 
+  var XHR_TIMEOUT_MS = 15000;
+  var STAGGER_DELAY_MS = 500;
+  var POLL_INTERVAL_MS = 60000;
+  var RELOAD_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+  var pageLoadedAt = (new Date()).getTime();
+  var pickerOpen = false;
+  var batchSupported = true;
+  var staggerTimer = null;
+  var inFlightRequests = {};
+
   var TRAIN_COLOR_CLASSES = [
     'train-color-default',
     'train-color-123',
@@ -23,6 +34,20 @@
     'train-color-jz',
     'train-color-g'
   ];
+
+  function trimStr(str) {
+    return String(str === null || str === undefined ? '' : str).replace(/^\s+|\s+$/g, '');
+  }
+
+  function hasOwnKeys(obj) {
+    if (!obj) return false;
+    for (var k in obj) {
+      if (Object.prototype.hasOwnProperty.call(obj, k)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   function isValidStation(id) {
     return typeof id === 'string' && /^[A-Z0-9]{2,5}$/.test(id);
@@ -60,6 +85,120 @@
     }
   }
 
+  function clearStaggerTimer() {
+    if (staggerTimer !== null && typeof window.clearTimeout === 'function') {
+      window.clearTimeout(staggerTimer);
+    }
+    staggerTimer = null;
+  }
+
+  function abortRequest(slot) {
+    var entry = inFlightRequests[slot];
+    if (!entry) return;
+    entry.done = true;
+    if (entry.timer !== null && typeof window.clearTimeout === 'function') {
+      window.clearTimeout(entry.timer);
+    }
+    delete inFlightRequests[slot];
+    try {
+      if (entry.xhr && typeof entry.xhr.abort === 'function') {
+        entry.xhr.abort();
+      }
+    } catch (e) {
+      // ignore abort errors on old WebKit
+    }
+  }
+
+  function abortAllRequests(includeStops) {
+    clearStaggerTimer();
+    for (var slot in inFlightRequests) {
+      if (Object.prototype.hasOwnProperty.call(inFlightRequests, slot)) {
+        if (!includeStops && slot === 'stops') continue;
+        abortRequest(slot);
+      }
+    }
+  }
+
+  function sendJsonGet(slot, url, onSuccess, onError) {
+    abortRequest(slot);
+
+    var xhttp = new XMLHttpRequest();
+    var entry = { xhr: xhttp, timer: null, done: false };
+    inFlightRequests[slot] = entry;
+
+    function finish() {
+      if (entry.done) return false;
+      entry.done = true;
+      if (entry.timer !== null && typeof window.clearTimeout === 'function') {
+        window.clearTimeout(entry.timer);
+      }
+      if (inFlightRequests[slot] === entry) {
+        delete inFlightRequests[slot];
+      }
+      return true;
+    }
+
+    if (typeof window.setTimeout === 'function') {
+      entry.timer = window.setTimeout(function() {
+        if (!finish()) return;
+        try {
+          if (typeof xhttp.abort === 'function') xhttp.abort();
+        } catch (e) {}
+        if (onError) onError(0);
+      }, XHR_TIMEOUT_MS);
+    }
+
+    try {
+      xhttp.timeout = XHR_TIMEOUT_MS;
+    } catch (e) {}
+
+    xhttp.onload = function() {
+      if (!finish()) return;
+      if (xhttp.status !== 200) {
+        if (onError) onError(xhttp.status);
+        return;
+      }
+      var js;
+      try {
+        js = JSON.parse(xhttp.responseText);
+      } catch (e) {
+        if (onError) onError(0);
+        return;
+      }
+      if (onSuccess) onSuccess(js);
+    };
+
+    xhttp.onerror = function() {
+      if (!finish()) return;
+      if (onError) onError(0);
+    };
+
+    xhttp.ontimeout = function() {
+      if (!finish()) return;
+      if (onError) onError(0);
+    };
+
+    xhttp.onabort = function() {
+      finish();
+    };
+
+    xhttp.open('GET', url, true);
+    xhttp.send();
+    return xhttp;
+  }
+
+  function maybePeriodicReload(nowMs) {
+    if (pickerOpen) return false;
+    var now = typeof nowMs === 'number' ? nowMs : (new Date()).getTime();
+    if (now - pageLoadedAt >= RELOAD_INTERVAL_MS) {
+      if (window.location && typeof window.location.reload === 'function') {
+        window.location.reload();
+        return true;
+      }
+    }
+    return false;
+  }
+
   function populateSelectOptions() {
     if (selectPopulated || !stopsLoaded) return;
     var select = document.getElementById('pickerSelect');
@@ -91,21 +230,27 @@
     if (stopsLoading) return;
     stopsLoading = true;
 
+    abortRequest('stops');
     var xhttp = new XMLHttpRequest();
+    var entry = { xhr: xhttp, timer: null, done: false };
+    inFlightRequests.stops = entry;
+
     xhttp.onload = function() {
       stopsLoading = false;
+      entry.done = true;
+      delete inFlightRequests.stops;
       if (xhttp.status !== 200) return;
 
       var lines = xhttp.responseText.split('\n');
       var parsed = [];
       var map = {};
       for (var i = 1; i < lines.length; i++) {
-        var line = lines[i].trim();
+        var line = trimStr(lines[i]);
         if (!line) continue;
         var commaIdx = line.indexOf(',');
         if (commaIdx > -1) {
-          var id = line.substring(0, commaIdx).trim();
-          var rawName = line.substring(commaIdx + 1).trim();
+          var id = trimStr(line.substring(0, commaIdx));
+          var rawName = trimStr(line.substring(commaIdx + 1));
           if (!isValidStation(id)) continue;
           var trainLine = id.charAt(0);
           var displayName = rawName + ' (' + trainLine + ')';
@@ -128,12 +273,15 @@
     };
     xhttp.onerror = function() {
       stopsLoading = false;
+      entry.done = true;
+      delete inFlightRequests.stops;
     };
     xhttp.open('GET', '/mta/static/js/stops.txt', true);
     xhttp.send();
   }
 
   function showPicker() {
+    pickerOpen = true;
     setHidden(document.getElementById('main'), true);
     setHidden(document.getElementById('picker'), false);
 
@@ -148,6 +296,7 @@
   }
 
   function hidePicker() {
+    pickerOpen = false;
     setHidden(document.getElementById('picker'), true);
     setHidden(document.getElementById('main'), false);
   }
@@ -268,7 +417,8 @@
     var ampIdx = raw.indexOf('&');
     if (ampIdx > -1) {
       stationPart = raw.substring(0, ampIdx);
-      var extraPart = raw.substring(ampIdx + 1).trim().toUpperCase();
+      var restParts = raw.substring(ampIdx + 1).split('&');
+      var extraPart = trimStr(restParts[0]).toUpperCase();
       if (extraPart === '') {
         EXTRA_TRAIN = '';
       } else if (isValidTrain(extraPart)) {
@@ -281,7 +431,7 @@
     var candidates = stationPart.split(',');
     var validated = [];
     for (var i = 0; i < candidates.length; i++) {
-      var cand = candidates[i].trim().toUpperCase();
+      var cand = trimStr(candidates[i]).toUpperCase();
       if (isValidStation(cand)) {
         validated.push(cand);
       }
@@ -308,9 +458,8 @@
       setFromHash();
       if (!arraysEqual(prevStations, STATIONS)) {
         setupStations();
-      }
-      if (prevExtra !== EXTRA_TRAIN) {
-        loadAlert2();
+      } else if (prevExtra !== EXTRA_TRAIN) {
+        refreshAll();
       }
     }
   }
@@ -380,7 +529,158 @@
       stationsContainer.classList.remove('small');
     }
 
-    loadTimesFromUrl();
+    refreshAll();
+  }
+
+  function renderStationData(station, refsOrEl, js, doAlert) {
+    if (!js) return;
+    var refs = refsOrEl && refsOrEl.dirs ? refsOrEl : cacheStationRefs(refsOrEl);
+    var stationEl = refs.root;
+    var train = station.charAt(0);
+
+    setHidden(stationEl, false);
+    setText(refs.title, js.name || '');
+
+    if (doAlert && js.status) {
+      var alerts = '';
+      var alertList = js.status.alerts || [];
+      for (var a = 0; a < alertList.length; a++) {
+        if (alerts !== '') {
+          alerts += '\n';
+        }
+        alerts += alertList[a];
+      }
+      var body = document.getElementById('main');
+      var alertEl = body ? body.querySelector('.alerts') : null;
+      if (alertEl) {
+        if (js.status.status === 'Good Service') {
+          setHidden(alertEl, true);
+        } else {
+          setHidden(alertEl, false);
+          setText(alertEl.querySelector('.alertsTitle'), train + ': ' + (js.status.status || '?'));
+          setText(alertEl.querySelector('.alertsBody'), alerts);
+        }
+      }
+    }
+
+    var outbound = false;
+    var routeTimes = js.route_times;
+    if (!routeTimes || !hasOwnKeys(routeTimes)) {
+      routeTimes = { outbound: [], inbound: [] };
+    }
+
+    var idx = 0;
+    var secondRoute = '';
+    var route;
+    for (route in routeTimes) {
+      if (Object.prototype.hasOwnProperty.call(routeTimes, route)) {
+        if (idx > 1) break;
+        if (idx === 1) {
+          secondRoute = route;
+        }
+        idx++;
+      }
+    }
+
+    idx = 0;
+    for (route in routeTimes) {
+      if (!Object.prototype.hasOwnProperty.call(routeTimes, route)) continue;
+      if (idx > 1) break;
+
+      var dirName = 'outbound';
+      var rName = route.replace(/ [-&] .*/, '').replace(/, .*/, '');
+      var otherRoute = idx === 0 ? secondRoute : '';
+      idx++;
+
+      if (route === 'Manhattan' ||
+        route === '34 St - Hudson Yards' ||
+        route === '8 Av' ||
+        route.indexOf('Uptown') > -1 ||
+        otherRoute === 'Church Av' ||
+        otherRoute.indexOf('Downtown') > -1 ||
+        outbound === true) {
+        dirName = 'inbound';
+      } else {
+        outbound = true;
+      }
+
+      var times = routeTimes[route] || [];
+      var dirRefs = refs.dirs[dirName];
+      setText(dirRefs.title, rName);
+
+      for (var j = 0; j < 3; j++) {
+        var rowRef = dirRefs.rows[j];
+        if (!rowRef || !rowRef.row) continue;
+
+        if (j >= times.length) {
+          setHidden(rowRef.row, true);
+        } else {
+          setHidden(rowRef.row, false);
+          var time = times[j];
+          var trainName = String(time.train_name || '?');
+
+          if (trainName.length === 2 && trainName.charAt(1) === 'X') {
+            trainName = trainName.charAt(0);
+            setClassToggle(rowRef.color, 'express', 'local');
+          } else {
+            setClassToggle(rowRef.color, 'local', 'express');
+          }
+
+          setText(rowRef.name, trainName);
+          if (STATIONS.length > 1) {
+            colorTrain(rowRef.color, trainName);
+          }
+          setText(rowRef.count, time.mins);
+          setText(rowRef.time, time.time);
+        }
+      }
+    }
+  }
+
+  function renderExtraAlert(train, js) {
+    var body = document.getElementById('main');
+    var alertEl = body ? body.querySelector('.alerts2') : null;
+    if (!alertEl) return;
+    if (!isValidTrain(train) || !js) {
+      setHidden(alertEl, true);
+      return;
+    }
+
+    var alerts = '';
+    var alertList = js.alerts || [];
+    for (var i = 0; i < alertList.length; i++) {
+      if (alerts !== '') {
+        alerts += '\n';
+      }
+      alerts += alertList[i];
+    }
+    if (js.status === 'Good Service') {
+      setHidden(alertEl, true);
+    } else {
+      setHidden(alertEl, false);
+      setText(alertEl.querySelector('.alertsTitle'), train + ': ' + (js.status || '?'));
+      setText(alertEl.querySelector('.alertsBody'), alerts);
+    }
+  }
+
+  function loadTimes(station, refsOrEl, doAlert, slot, onDone) {
+    if (!isValidStation(station)) {
+      if (onDone) onDone(false);
+      return;
+    }
+    var reqSlot = slot || ('station:' + station);
+    var url = '/mta/countdown/' + encodeURIComponent(station) + (doAlert ? '' : '?alerts=0');
+    sendJsonGet(
+      reqSlot,
+      url,
+      function(js) {
+        renderStationData(station, refsOrEl, js, doAlert);
+        if (onDone) onDone(true);
+      },
+      function() {
+        if (onDone) onDone(false);
+      }
+    );
   }
 
   function loadTimesFromUrl() {
@@ -388,130 +688,9 @@
       var station = STATIONS[i];
       var refs = stationRefs[i] || cacheStationRefs(document.getElementById('station' + i));
       if (refs && refs.root) {
-        loadTimes(station, refs, i === 0);
+        loadTimes(station, refs, i === 0, 'station:' + i);
       }
     }
-  }
-
-  function loadTimes(station, refsOrEl, doAlert) {
-    if (!isValidStation(station)) return;
-    var refs = refsOrEl && refsOrEl.dirs ? refsOrEl : cacheStationRefs(refsOrEl);
-    var stationEl = refs.root;
-    var train = station.charAt(0);
-    var xhttp = new XMLHttpRequest();
-
-    xhttp.onload = function() {
-      if (xhttp.status !== 200) return;
-      var js;
-      try {
-        js = JSON.parse(xhttp.responseText);
-      } catch (e) {
-        return;
-      }
-      if (!js) return;
-
-      setHidden(stationEl, false);
-      setText(refs.title, js.name || '');
-
-      if (doAlert && js.status) {
-        var alerts = '';
-        var alertList = js.status.alerts || [];
-        for (var a = 0; a < alertList.length; a++) {
-          if (alerts !== '') {
-            alerts += '\n';
-          }
-          alerts += alertList[a];
-        }
-        var body = document.getElementById('main');
-        var alertEl = body ? body.querySelector('.alerts') : null;
-        if (alertEl) {
-          if (js.status.status === 'Good Service') {
-            setHidden(alertEl, true);
-          } else {
-            setHidden(alertEl, false);
-            setText(alertEl.querySelector('.alertsTitle'), train + ': ' + (js.status.status || '?'));
-            setText(alertEl.querySelector('.alertsBody'), alerts);
-          }
-        }
-      }
-
-      var outbound = false;
-      var routeTimes = js.route_times;
-      if (!routeTimes || Object.keys(routeTimes).length === 0) {
-        routeTimes = { outbound: [], inbound: [] };
-      }
-
-      var idx = 0;
-      var secondRoute = '';
-      var route;
-      for (route in routeTimes) {
-        if (Object.prototype.hasOwnProperty.call(routeTimes, route)) {
-          if (idx > 1) break;
-          if (idx === 1) {
-            secondRoute = route;
-          }
-          idx++;
-        }
-      }
-
-      idx = 0;
-      for (route in routeTimes) {
-        if (!Object.prototype.hasOwnProperty.call(routeTimes, route)) continue;
-        if (idx > 1) break;
-
-        var dirName = 'outbound';
-        var rName = route.replace(/ [-&] .*/, '').replace(/, .*/, '');
-        var otherRoute = idx === 0 ? secondRoute : '';
-        idx++;
-
-        if (route === 'Manhattan' ||
-          route === '34 St - Hudson Yards' ||
-          route === '8 Av' ||
-          route.indexOf('Uptown') > -1 ||
-          otherRoute === 'Church Av' ||
-          otherRoute.indexOf('Downtown') > -1 ||
-          outbound === true) {
-          dirName = 'inbound';
-        } else {
-          outbound = true;
-        }
-
-        var times = routeTimes[route] || [];
-        var dirRefs = refs.dirs[dirName];
-        setText(dirRefs.title, rName);
-
-        for (var j = 0; j < 3; j++) {
-          var rowRef = dirRefs.rows[j];
-          if (!rowRef || !rowRef.row) continue;
-
-          if (j >= times.length) {
-            setHidden(rowRef.row, true);
-          } else {
-            setHidden(rowRef.row, false);
-            var time = times[j];
-            var trainName = String(time.train_name || '?');
-
-            if (trainName.length === 2 && trainName.charAt(1) === 'X') {
-              trainName = trainName.charAt(0);
-              setClassToggle(rowRef.color, 'express', 'local');
-            } else {
-              setClassToggle(rowRef.color, 'local', 'express');
-            }
-
-            setText(rowRef.name, trainName);
-            if (STATIONS.length > 1) {
-              colorTrain(rowRef.color, trainName);
-            }
-            setText(rowRef.count, time.mins);
-            setText(rowRef.time, time.time);
-          }
-        }
-      }
-    };
-
-    var url = '/mta/countdown/' + encodeURIComponent(station) + (doAlert ? '' : '?alerts=0');
-    xhttp.open('GET', url, true);
-    xhttp.send();
   }
 
   function getTrainColorClass(train) {
@@ -539,44 +718,141 @@
     el.classList.add(targetCls);
   }
 
-  function loadAlert2() {
-    var body = document.getElementById('main');
-    var alertEl = body ? body.querySelector('.alerts2') : null;
+  function loadAlert2(onDone) {
     if (!isValidTrain(EXTRA_TRAIN)) {
-      setHidden(alertEl, true);
+      renderExtraAlert('', null);
+      if (onDone) onDone(false);
       return;
     }
 
-    var xhttp = new XMLHttpRequest();
     var train = EXTRA_TRAIN;
-    xhttp.onload = function() {
-      if (xhttp.status !== 200) return;
-      var js;
-      try {
-        js = JSON.parse(xhttp.responseText);
-      } catch (e) {
+    sendJsonGet(
+      'alert2',
+      '/mta/alerts/' + encodeURIComponent(train),
+      function(js) {
+        renderExtraAlert(train, js);
+        if (onDone) onDone(true);
+      },
+      function() {
+        if (onDone) onDone(false);
+      }
+    );
+  }
+
+  function startStaggeredFallback() {
+    abortAllRequests(false);
+
+    var tasks = [];
+    for (var i = 0; i < STATIONS.length; i++) {
+      (function(idx) {
+        tasks.push(function(next) {
+          var station = STATIONS[idx];
+          var refs = stationRefs[idx] || cacheStationRefs(document.getElementById('station' + idx));
+          if (!refs || !refs.root) {
+            next(false);
+            return;
+          }
+          loadTimes(station, refs, idx === 0, 'station:' + idx, next);
+        });
+      })(i);
+    }
+
+    if (isValidTrain(EXTRA_TRAIN)) {
+      tasks.push(function(next) {
+        loadAlert2(next);
+      });
+    } else {
+      renderExtraAlert('', null);
+    }
+
+    var anySucceeded = false;
+    function runStep(stepIdx) {
+      if (stepIdx >= tasks.length) {
+        if (anySucceeded) {
+          maybePeriodicReload();
+        }
         return;
       }
-      if (!js || !alertEl) return;
-
-      var alerts = '';
-      var alertList = js.alerts || [];
-      for (var i = 0; i < alertList.length; i++) {
-        if (alerts !== '') {
-          alerts += '\n';
+      tasks[stepIdx](function(ok) {
+        if (ok) anySucceeded = true;
+        if (stepIdx + 1 < tasks.length) {
+          if (typeof window.setTimeout === 'function') {
+            staggerTimer = window.setTimeout(function() {
+              staggerTimer = null;
+              runStep(stepIdx + 1);
+            }, STAGGER_DELAY_MS);
+          } else {
+            runStep(stepIdx + 1);
+          }
+        } else if (anySucceeded) {
+          maybePeriodicReload();
         }
-        alerts += alertList[i];
+      });
+    }
+
+    runStep(0);
+  }
+
+  function refreshAll() {
+    clearStaggerTimer();
+
+    if (!batchSupported) {
+      startStaggeredFallback();
+      return;
+    }
+
+    var encodedStations = [];
+    for (var i = 0; i < STATIONS.length; i++) {
+      if (isValidStation(STATIONS[i])) {
+        encodedStations.push(encodeURIComponent(STATIONS[i]));
       }
-      if (js.status === 'Good Service') {
-        setHidden(alertEl, true);
-      } else {
-        setHidden(alertEl, false);
-        setText(alertEl.querySelector('.alertsTitle'), train + ': ' + (js.status || '?'));
-        setText(alertEl.querySelector('.alertsBody'), alerts);
+    }
+    if (encodedStations.length === 0) return;
+
+    if (!isValidTrain(EXTRA_TRAIN)) {
+      renderExtraAlert('', null);
+    }
+
+    var url = '/mta/batch?stations=' + encodedStations.join(',');
+    var requestedExtra = '';
+    if (isValidTrain(EXTRA_TRAIN)) {
+      requestedExtra = EXTRA_TRAIN;
+      url += '&extra=' + encodeURIComponent(requestedExtra);
+    }
+
+    // Abort any older fallback requests before issuing a batch request
+    for (var slot in inFlightRequests) {
+      if (Object.prototype.hasOwnProperty.call(inFlightRequests, slot)) {
+        if (slot !== 'stops' && slot !== 'batch') {
+          abortRequest(slot);
+        }
       }
-    };
-    xhttp.open('GET', '/mta/alerts/' + encodeURIComponent(train), true);
-    xhttp.send();
+    }
+
+    sendJsonGet(
+      'batch',
+      url,
+      function(data) {
+        if (!data || !data.stations) return;
+        for (var j = 0; j < STATIONS.length; j++) {
+          var st = STATIONS[j];
+          var refs = stationRefs[j] || cacheStationRefs(document.getElementById('station' + j));
+          if (refs && refs.root && data.stations[st]) {
+            renderStationData(st, refs, data.stations[st], j === 0);
+          }
+        }
+        if (requestedExtra && data.extra_alert) {
+          renderExtraAlert(requestedExtra, data.extra_alert);
+        }
+        maybePeriodicReload();
+      },
+      function(status) {
+        if (status === 404) {
+          batchSupported = false;
+          startStaggeredFallback();
+        }
+      }
+    );
   }
 
   function bindUiEvents() {
@@ -614,11 +890,9 @@
     setFromHash();
     bindUiEvents();
     setupStations();
-    loadAlert2();
 
     if (typeof window.setInterval === 'function') {
-      window.setInterval(loadTimesFromUrl, 60000);
-      window.setInterval(loadAlert2, 60000);
+      window.setInterval(refreshAll, POLL_INTERVAL_MS);
     }
   }
 
@@ -646,6 +920,9 @@
       loadTimes: loadTimes,
       loadAlert2: loadAlert2,
       loadStops: loadStops,
+      refreshAll: refreshAll,
+      abortAllRequests: abortAllRequests,
+      maybePeriodicReload: maybePeriodicReload,
       colorTrain: colorTrain,
       isValidStation: isValidStation,
       isValidTrain: isValidTrain,
@@ -655,7 +932,10 @@
           extraTrain: EXTRA_TRAIN,
           allStations: ALL_STATIONS,
           currentPickerStations: currentPickerStations,
-          stopsLoaded: stopsLoaded
+          stopsLoaded: stopsLoaded,
+          batchSupported: batchSupported,
+          pickerOpen: pickerOpen,
+          inFlightSlots: inFlightRequests
         };
       },
       setState: function(s) {
@@ -670,6 +950,9 @@
         }
         if (s.currentPickerStations !== undefined) currentPickerStations = s.currentPickerStations;
         if (s.stopsLoaded !== undefined) stopsLoaded = s.stopsLoaded;
+        if (s.batchSupported !== undefined) batchSupported = s.batchSupported;
+        if (s.pickerOpen !== undefined) pickerOpen = s.pickerOpen;
+        if (s.pageLoadedAt !== undefined) pageLoadedAt = s.pageLoadedAt;
       }
     };
   }

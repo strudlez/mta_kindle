@@ -189,7 +189,7 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
           return Response.json({
             status: 'Delays',
             service_change_summaries: {
-              both: [`${train} train delays`],
+              both: [`${train} train delays`, `${train} local service`],
               north: [],
               south: [],
             },
@@ -280,6 +280,17 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
 
       await page.locator('.alerts2').waitFor({ state: 'visible' });
       expect(await page.locator('.alerts2 .alertsTitle').textContent()).toBe('4: Delays');
+      expect(await page.evaluate(() => document.compatMode)).toBe('BackCompat');
+      const alertsStyle = await page.locator('.alerts2 .alertsBody').evaluate((el) => ({
+        whiteSpace: getComputedStyle(el).whiteSpace,
+        height: el.getBoundingClientRect().height,
+      }));
+      expect(alertsStyle.whiteSpace).toBe('pre-line');
+      expect(alertsStyle.height).toBeGreaterThan(30);
+
+      // /static/ alias works for prefix-stripping reverse proxies
+      const staticResp = await page.request.get(`${baseUrl}/static/css/styles.css`);
+      expect(staticResp.status()).toBe(200);
 
       // No horizontal overflow on Kindle viewport
       const overflow = await page.evaluate(
@@ -368,8 +379,8 @@ describe('End-to-End Browser UI Tests (Kindle Viewport)', () => {
       );
       expect(aBg).toBe('rgb(0, 57, 166)'); // #0039A6 for A train
 
-      // Secondary station used ?alerts=0 so goodservice.io was NOT called for 'A'
-      expect(requestedUrls.some((u) => u === '/mta/countdown/A32?alerts=0')).toBe(true);
+      // Multi-station mode used a single /mta/batch request and skipped goodservice.io for 'A'
+      expect(requestedUrls.some((u) => u === '/mta/batch?stations=L08,A32&extra=4')).toBe(true);
       expect(goodServiceRoutes.includes('A')).toBe(false);
 
       expect(pageErrors).toEqual([]);

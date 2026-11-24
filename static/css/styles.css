@@ -152,6 +152,9 @@
   font-size: 30px;
   padding: 10px;
 }
+.alertsBody {
+  white-space: pre-line;
+}
 
 #picker {
   padding: 20px;
